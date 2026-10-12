@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { chromeAvailable, closeBrowser, headlessUserAgent, pageFetch, runTrigger } from "../src/browser.js";
+import { browserAvailable, closeBrowser, headlessUserAgent, pageFetch, runTrigger } from "../src/browser.js";
 import { type Fixture, PUBLIC_BEARER, startFixture } from "./fixture/server.js";
 
 // the browser keeps what it learned about the installed Chrome under the home: not the user's own
@@ -46,7 +46,7 @@ describe("fixture site (plain http)", () => {
   });
 });
 
-describe("browser", { skip: !chromeAvailable() && "Google Chrome not installed" }, () => {
+describe("browser", { skip: !browserAvailable() && "no Chromium browser installed" }, () => {
   let fx: Fixture;
   let profileDir: string;
   before(async () => {
@@ -178,8 +178,8 @@ describe("browser", { skip: !chromeAvailable() && "Google Chrome not installed" 
     assert.doesNotMatch(String(call?.headers["user-agent"]), /HeadlessChrome/);
   });
 
-  test("the headless user agent is asked of Chrome once per installed Chrome, then read from disk", async () => {
-    const file = join(HOME, "chrome-ua.json");
+  test("the headless user agent is asked of the browser once per installed browser, then read from disk", async () => {
+    const file = join(HOME, "browser-ua.json");
     rmSync(file, { force: true });
     // nothing on disk: Chrome is started to ask, and the answer is kept
     const probed = await headlessUserAgent();
