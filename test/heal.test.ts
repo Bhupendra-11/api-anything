@@ -173,6 +173,85 @@ fetch("/api/"+"${QID.slice(0, 11)}"+"${QID.slice(11)}"+"/User?name="+location.pa
     assert.ok(apiPaths.includes(`/api/${DECOY}/User`), `the candidate itself was sent: ${JSON.stringify(apiPaths)}`);
   });
 
+  test("a trigger page that answers 500 learned nothing about the op: the heal stops, and nothing is stale", async () => {
+    const { server, base } = await serve((req, res) => {
+      const u = new URL(req.url!, "http://x");
+      if (u.pathname.startsWith("/api/")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end("{}"); // the data is gone
+      }
+      // the page redirects to where it fails; the final address keeps a #fragment the request never carries
+      if (u.pathname === "/page") return void res.writeHead(302, { location: "/down#retry" }).end();
+      res.writeHead(500, { "content-type": "text/html" });
+      res.end("<html><body>Internal Server Error</body></html>");
+    });
+    servers.push(server);
+    saveSite(
+      parseSite({
+        name: "down",
+        baseUrl: base,
+        operations: [
+          {
+            name: "get",
+            readOnly: true,
+            request: { method: "GET", url: `${base}/api/thing?q=abc`, headers: {} },
+            slots: [{ param: "q", at: ["query:q"] }],
+            trigger: { url: `${base}/page?q={q}` },
+            match: { method: "GET", path: "/api/thing" },
+            params: [{ name: "q", example: "abc" }],
+            response: { extract: "items" },
+          },
+        ],
+      }),
+    );
+    const r = await call("down", "get", { q: "xyz" }, fast);
+    assert.equal(r.ok, false);
+    assert.match(r.reason ?? "", /heal stopped: the trigger page answered HTTP 500/);
+    assert.equal(staleMark("down", "get"), undefined);
+  });
+
+  test("a candidate whose replay gets no answer still returns the site's own answer for these args, and nothing is stale", async () => {
+    const { server, base } = await serve((req, res) => {
+      const u = new URL(req.url!, "http://x");
+      if (u.pathname === "/api/old") return void res.writeHead(404).end();
+      if (u.pathname === "/api/new") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ data: [{ q: u.searchParams.get("q") }] }));
+      }
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end('<script>fetch("/api/new?q="+new URLSearchParams(location.search).get("q"))</script>');
+    });
+    servers.push(server);
+    saveSite(
+      parseSite({
+        name: "reset",
+        baseUrl: base,
+        operations: [
+          {
+            name: "op",
+            readOnly: true,
+            request: { method: "GET", url: `${base}/api/old?q=alice`, headers: {} },
+            slots: [{ param: "q", at: ["query:q"] }],
+            params: [{ name: "q", example: "alice" }],
+            match: { method: "GET", path: "/api/*" },
+            trigger: { url: `${base}/page?q={q}` },
+            response: { extract: "data" },
+          },
+        ],
+      }),
+    );
+    // the candidate's replay from Node meets a reset; the page's own request answered
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (new URL(String(input)).pathname === "/api/new") throw new TypeError("fetch failed: connection reset");
+      return fetch(input, init);
+    }) as typeof fetch;
+    const r = await call("reset", "op", { q: "bob" }, { ...fast, fetchImpl });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.deepEqual(r.data, [{ q: "bob" }]);
+    assert.match(r.reason ?? "", /answered by the site's own request/);
+    assert.equal(staleMark("reset", "op"), undefined);
+  });
+
   test("call() never throws when the heal's browser run fails", async () => {
     saveSite(
       parseSite({
@@ -193,7 +272,9 @@ fetch("/api/"+"${QID.slice(0, 11)}"+"${QID.slice(11)}"+"/User?name="+location.pa
     const fetchImpl = (async () => new Response("", { status: 404 })) as unknown as typeof fetch;
     const r = await call("d", "get", { q: "abc" }, { ...fast, fetchImpl });
     assert.equal(r.ok, false);
-    assert.equal(r.class, "drift");
-    assert.match(r.reason ?? "", /heal failed/);
+    // the trigger page never loaded: nothing was learned about the op, so it is not stale
+    assert.equal(r.class, "error");
+    assert.match(r.reason ?? "", /heal stopped: the browser run failed/);
+    assert.equal(staleMark("d", "get"), undefined);
   });
 });

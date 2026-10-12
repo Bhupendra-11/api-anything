@@ -3,7 +3,14 @@
  * the heal-loop guards, and the write rules. Always sends the stored template first; healing is
  * reactive only.
  */
-import { browserAvailable, type PageFetchResult, ProfileInUse, pageFetch, profileCookies } from "./browser.js";
+import {
+  browserAvailable,
+  type PageFetchResult,
+  PageUnreachable,
+  ProfileInUse,
+  pageFetch,
+  profileCookies,
+} from "./browser.js";
 import { type Class, judge } from "./classify.js";
 import { capOutput } from "./extract.js";
 import {
@@ -11,7 +18,9 @@ import {
   type HealResult,
   healOperation,
   judgeExchange,
+  learnedNothing,
   PROFILE_HINT,
+  pageDown,
   profileDir,
   runOpTrigger,
 } from "./heal.js";
@@ -147,7 +156,11 @@ async function attempt(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
         resent ||
         (run.loginWall
           ? { tier, class: "auth", reason: `the trigger landed on a sign-in page (${run.loginWall})` }
-          : { tier, class: "drift", reason: `the trigger fired no request matching ${JSON.stringify(op.match)}` });
+          : (pageDown(run.capture) ?? {
+              tier,
+              class: "drift",
+              reason: `the trigger fired no request matching ${JSON.stringify(op.match)}`,
+            }));
       if (!run.repeats) return a;
       const stopped = run.repeats === 1 ? "the repeat was" : `${run.repeats} repeats were`;
       return { ...a, note: `the page sent this write ${run.repeats + 1} times: ${stopped} stopped in the browser` };
@@ -205,7 +218,16 @@ async function attempt(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
         : `the write may have run: check the site first. Do not retry: ${why}`;
       return { tier, class: "error", reason: e.message, ambiguous: true, hint };
     }
-    return { tier, class: "error", reason: (e as Error).message.split("\n")[0]!, ambiguous: true };
+    // No answer (a timeout, a reset, a page that did not load) teaches nothing about the request; a
+    // trigger step that failed (its button is gone) does.
+    const reason = (e as Error).message.split("\n")[0]!;
+    return {
+      tier,
+      class: "error",
+      reason,
+      ambiguous: true,
+      ...(tier < 3 || e instanceof PageUnreachable ? { server: true } : {}),
+    };
   }
 }
 
@@ -261,6 +283,15 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
     );
   }
 
+  // A server that sometimes answers without the data (Google's fallback page, issue #21) answers a second
+  // try: before the args are blamed or a browser heals, the same request goes once more.
+  if (a.missing && op.readOnly && a.tier < 3) {
+    const again = await attempt(ctx, op, a.tier);
+    if (again.class === "ok")
+      return success(again, { reason: `the first answer had no data (${a.reason}); a second try did` });
+    if (learnedNothing(again)) return fail(again);
+  }
+
   // "No such user" and "no results" look exactly like a moved extract path. If the example args
   // still return data through the same template, nothing drifted: the args are the problem.
   const examples = exampleArgs(op);
@@ -279,8 +310,8 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
           },
         );
       }
-      // throttled or challenged while checking: stop, don't spend a heal (a browser run) against it
-      if (b.class === "rate" || b.class === "blocked" || b.class === "auth") return fail(b);
+      // throttled, challenged or a server failure while checking: stop, don't spend a heal (a browser run) against it
+      if (learnedNothing(b)) return fail(b);
       examplesFail = true;
     }
   }
@@ -300,7 +331,7 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
       const b = await attempt(ctx, op, 3);
       if (b.class === "ok") return success(b, { reason: guard });
       // the site's own request doesn't answer either: stop paying a browser run per call
-      if (!b.hint && b.class !== "auth")
+      if (!b.hint && b.class !== "auth" && !b.server)
         markStale(ctx.site, op.name, stale?.reason ?? guard, undefined, undefined, { tier3: false });
     }
     // `heal` refuses writes: a stale write is re-learned
@@ -322,6 +353,9 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
   if (h.outcome === "healed") return success(h.attempt, { healed: true });
   // Throttled, challenged, logged out, or no browser: nothing was learned about the op, so it is not stale.
   if (h.outcome === "failed" && h.transient) {
+    // the replay that would have saved a candidate got no answer, but the site's own request did: that is the tier-3 read
+    if (h.fallback?.class === "ok" && ctx.maxTier >= 3)
+      return success(h.fallback, { reason: `heal stopped (${h.reason}); answered by the site's own request` });
     const b = h.attempt ?? a;
     return fail(b, { reason: `${a.reason}; heal stopped: ${h.reason}` });
   }
@@ -625,8 +659,25 @@ export async function heal(
   );
   const ms = Date.now() - t0;
   if (h.outcome === "healed") return { ...success(h.attempt, { healed: true }), strategy: h.strategy, ms };
-  if (h.outcome === "identical")
-    return { ok: true, class: "ok", healed: false, reason: "the stored template is already current", ms };
+  if (h.outcome === "identical") {
+    // The same template is no proof it works: its answer says whether the op does.
+    const filled = withDefaults(op, args);
+    const complete = op.params.every((p) => !p.required || filled[p.name] !== undefined);
+    const b = await attempt({ ...ctx, args: complete ? filled : (exampleArgs(op) ?? filled) }, op, tier);
+    const why = "the stored template is already current";
+    if (b.class === "ok") return { ...success(b, { healed: false, reason: why }), ms: Date.now() - t0 };
+    return {
+      ok: false,
+      class: b.class,
+      tier: b.tier,
+      reason: `${why}, and it answers: ${b.reason}`,
+      next:
+        b.class === "drift"
+          ? `if the site works in a browser, re-learn the response recipe: api-anything add ${siteName} ${op.name} ... --extract <path> (api-anything capture <trigger url> shows the response); otherwise report it`
+          : nextFor(b.class, siteName, op, b),
+      ms: Date.now() - t0,
+    };
+  }
   const b = h.attempt ?? h.fallback;
   return {
     ok: false,

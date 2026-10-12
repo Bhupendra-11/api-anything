@@ -3,12 +3,25 @@
  * add (create), recapture (heal), and the tier-3 read. Rescan is the browserless heal.
  */
 import { join } from "node:path";
-import { browserAvailable, ProfileInUse, runTrigger } from "./browser.js";
+import { browserAvailable, PageUnreachable, ProfileInUse, runTrigger } from "./browser.js";
 import { botWall, type Class, judge } from "./classify.js";
 import { asText, escapeTemplate, fillTemplate, getAt, setAt, templateRefs, walk } from "./codec.js";
 import { capOutput, extract } from "./extract.js";
 import { buildRequest, MAX_REDIRECTS, ownMatch, REDIRECT, send } from "./http.js";
-import { type Args, ASSET_EXT, capturePages, checkExamples, hashLike, learnOperation, matches } from "./learn.js";
+import {
+  type Args,
+  ASSET_EXT,
+  arrayAround,
+  capturePages,
+  checkExamples,
+  hashLike,
+  learnOperation,
+  matches,
+  unplaced,
+} from "./learn.js";
+
+export { unplaced };
+
 import { scanSecrets } from "./secrets.js";
 import {
   cookieHeaderFor,
@@ -39,6 +52,8 @@ export interface Attempt {
   ambiguous?: boolean;
   /** the args may be the problem (data missing, or a bare 403); see Classified.missing */
   missing?: boolean;
+  /** the server failed or could not be reached; see Classified.server */
+  server?: boolean;
   /** the first answer was a redirect, so the server took the request (a write ran) */
   redirected?: boolean;
   /** a specific `next` for the agent (a local problem, not the site's) */
@@ -320,6 +335,18 @@ export async function runOpTrigger(
   };
 }
 
+/** The trigger page's own failure (a 5xx): its requests never fired, which says nothing about the op. */
+export function pageDown(capture: CaptureResult): Attempt | undefined {
+  // the page's last load: a redirect's end carries no #fragment, and a reload answers again
+  const page = capture.finalUrl.split("#")[0];
+  const status = capture.exchanges
+    .filter((e) => e.resourceType === "document" && e.response && e.request.url.split("#")[0] === page)
+    .at(-1)?.response?.status;
+  return status !== undefined && status >= 500
+    ? { tier: 3, class: "error", status, server: true, reason: `the trigger page answered HTTP ${status}` }
+    : undefined;
+}
+
 /** A tier-3 result: the site's own request, answered. */
 export function judgeExchange(op: Operation, e: Exchange): Attempt | undefined {
   const r = e.response;
@@ -506,15 +533,6 @@ export function captureTrigger(c: CaptureFile, args: Args): Trigger {
     ...(c.steps ? { steps: c.steps.map(step) } : {}),
   };
 }
-
-/** The args a trigger has no `{name}` for, in its URL, its soft-navigation page or its steps. */
-export const unplaced = (t: Trigger, args: Args): string[] =>
-  Object.keys(args).filter(
-    (k) =>
-      ![t.url, t.softFrom ?? "", ...(t.steps ?? []).flatMap((s) => [s.selector ?? "", s.value ?? ""])].some((x) =>
-        x.includes(`{${k}}`),
-      ),
-  );
 
 export function putOperation(site: Site, op: Operation): Site {
   const rest = site.operations.filter((o) => o.name !== op.name);
@@ -978,8 +996,10 @@ export type HealResult =
       transient?: boolean;
     };
 
-// A check answered with these says nothing about the candidate: stop, and don't spend a browser run on it.
+// A check answered with these, or with the server's own failure, says nothing about the candidate:
+// stop, and don't spend a browser run on it.
 const STOP: ReadonlySet<Class> = new Set(["rate", "blocked", "auth"]);
+export const learnedNothing = (a: Pick<Attempt, "class" | "server">) => STOP.has(a.class) || !!a.server;
 
 function saveHealed(
   site: string,
@@ -1051,17 +1071,19 @@ export async function healOperation(
     budget--;
     last = await o.validate(scanned.operation);
     if (last.class === "ok") return saveHealed(site, scanned.operation, "rescan", scanned.diff, last);
-    if (STOP.has(last.class))
+    if (learnedNothing(last))
       return { outcome: "failed", attempt: last, transient: true, reason: swapped.replace("%s", last.reason) };
     if (!budget) return { outcome: "failed", attempt: last, reason: swapped.replace("%s", last.reason) };
   }
   const tried = scanned ? swapped.replace("%s", last!.reason) : "rescan found nothing new";
   if (o.browser === false)
     return { outcome: "failed", attempt: last, reason: `${tried}; recapture needs the browser (maxTier 1)` };
+  // nothing was learned about the op: once a browser is installed, the next call heals
   if (!browserAvailable())
     return {
       outcome: "failed",
       attempt: last,
+      transient: true,
       reason: `${tried}; recapture needs a Chromium browser (Google Chrome, Brave, Edge or Chromium)`,
     };
 
@@ -1083,6 +1105,9 @@ export async function healOperation(
         transient: true,
         reason,
       };
+    // the page did not load: nothing it would have sent was seen
+    if (e instanceof PageUnreachable)
+      return { outcome: "failed", attempt: { tier: 3, class: "error", reason, server: true }, transient: true, reason };
     return { outcome: "failed", attempt: last, reason };
   }
   if (!run.matched && run.loginWall) {
@@ -1093,14 +1118,17 @@ export async function healOperation(
       reason: `the trigger landed on a sign-in page (${run.loginWall})`,
     };
   }
-  if (!run.capture.exchanges.some((e) => matches(op.match, e.request)))
+  if (!run.capture.exchanges.some((e) => matches(op.match, e.request))) {
+    const down = pageDown(run.capture);
+    if (down) return { outcome: "failed", attempt: down, transient: true, reason: down.reason };
     return {
       outcome: "failed",
       attempt: last,
       reason: `the trigger fired no request matching ${JSON.stringify(op.match)}`,
     };
+  }
   const seen = run.matched && judgeExchange(op, run.matched);
-  if (seen && STOP.has(seen.class))
+  if (seen && learnedNothing(seen))
     return {
       outcome: "failed",
       attempt: seen,
@@ -1111,6 +1139,26 @@ export async function healOperation(
   const fallback = op.readOnly && learnArgs === callArgs && run.matched ? judgeExchange(op, run.matched) : undefined;
   let fresh: Operation;
   let sessionValues: Record<string, string>;
+  // Where the op fills each param: a place the page filled with its own value can keep it (learn's paramSlots).
+  const was = walk(op.request);
+  const wasThere = new Map(was.map((l) => [JSON.stringify(l.at), l]));
+  const own = op.slots.filter((slot) => slot.param || slot.template);
+  const placed = new Set(own.map((slot) => JSON.stringify(slot.at)));
+  const established = own.flatMap((slot) => {
+    const leaf = wasThere.get(JSON.stringify(slot.at));
+    if (!leaf) return [];
+    const pattern = op.params.find((p) => p.name === slot.param)?.pattern;
+    const around = arrayAround(was, slot.at, placed);
+    return [
+      {
+        slot,
+        type: leaf.type,
+        value: leaf.value,
+        ...(pattern !== undefined ? { pattern } : {}),
+        ...(around !== undefined ? { around } : {}),
+      },
+    ];
+  });
   try {
     ({ operation: fresh, sessionValues } = learnOperation({
       exchanges: run.capture.exchanges,
@@ -1124,6 +1172,7 @@ export async function healOperation(
       readOnly: op.readOnly,
       loginCookies: o.loginCookies,
       public: op.public,
+      established,
     }));
   } catch (e) {
     return { outcome: "failed", attempt: last, fallback, reason: `re-learning failed: ${(e as Error).message}` };
@@ -1198,7 +1247,7 @@ export async function healOperation(
     outcome: "failed",
     attempt: last,
     fallback,
-    ...(STOP.has(last.class) ? { transient: true } : {}),
+    ...(learnedNothing(last) ? { transient: true } : {}),
     reason: `recaptured template failed replay: ${last.reason}`,
   };
 }

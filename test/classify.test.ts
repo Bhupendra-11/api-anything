@@ -159,6 +159,70 @@ test("input: 400 naming a param; error: 5xx and unexplained GraphQL errors", () 
   assert.equal(cls(op(), json(200, { errors: [{ message: "User has been suspended" }], data: null })), "error");
 });
 
+test("an error status in a 200 body is judged as the HTTP status it stands for, never as moved data", () => {
+  // Google batchexecute (issue #21): the payload's place holds a gRPC status instead
+  const rpc = op({ response: { format: "json", xssiPrefix: ")]}'", extract: "[0][0][2][1]" } });
+  const status = (code: number) => json(200, `)]}'\n\n39\n[["wrb.fr",null,null,null,null,[${code}]]]\n`);
+  assert.deepEqual(classify(rpc, status(13)), {
+    class: "error",
+    reason: `HTTP 200 carrying batchexecute error 13 (INTERNAL), judged as HTTP 500: )]}' 39 [["wrb.fr",null,null,null,null,[13]]]`,
+    server: true,
+  });
+  assert.equal(cls(rpc, status(14)), "error");
+  assert.equal(cls(rpc, status(8)), "rate");
+  assert.equal(cls(rpc, status(16)), "auth");
+  // NOT_FOUND is a 404: missing data, which the example args tell apart from drift
+  assert.deepEqual([cls(rpc, status(5)), classify(rpc, status(5)).missing], ["drift", true]);
+  // a bad request names no param: like missing data, the example args tell bad args (input) from drift
+  assert.deepEqual([cls(rpc, status(3)), classify(rpc, status(3)).missing], ["drift", true]);
+  // the status of the RPC the extract path reads, not of another one that failed first
+  const two = op({ response: { format: "json", extract: "[1][2].data" } });
+  const pair = JSON.stringify([
+    ["wrb.fr", "other", null, null, null, [8]],
+    ["wrb.fr", "target", null, null, null, [13]],
+  ]);
+  assert.equal(cls(two, json(200, pair)), "error");
+  // the target RPC is absent: another one's status is not its answer, so the data is missing
+  assert.equal(cls(two, json(200, JSON.stringify([["wrb.fr", "other", null, null, null, [8]]]))), "drift");
+  // a second RPC's failure does not undo the data the extract path finds
+  const mixed = `)]}'\n\n9\n[["wrb.fr",null,"[0,[\\"a\\"]]"],["wrb.fr",null,null,null,null,[13]]]\n`;
+  assert.equal(cls(rpc, json(200, mixed)), "ok");
+
+  // {"error": {...}} with a gRPC status or an HTTP code, and JSON-RPC
+  assert.equal(cls(op(), json(200, { error: { code: 503, message: "backend", status: "UNAVAILABLE" } })), "error");
+  assert.equal(cls(op(), json(200, { error: { code: 429, message: "slow down" } })), "rate");
+  assert.equal(cls(op(), json(200, { error: { code: 401, message: "who are you" } })), "auth");
+  assert.equal(cls(op(), json(200, { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "oops" } })), "error");
+  assert.equal(cls(op(), json(200, { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "no method" } })), "drift");
+  // an app's own error code is not a status: the missing data decides, as before
+  assert.equal(cls(op(), json(200, { error: { code: 190, message: "token expired" } })), "drift");
+  // without an extract path the body is the answer, so its error is too; data next to an error field is fine
+  const whole = op({ response: { format: "json" } });
+  assert.equal(cls(whole, json(200, { error: { status: "INTERNAL" } })), "error");
+  assert.equal(cls(op(), json(200, { data: { user: { name: "x" } }, error: { code: 500 } })), "ok");
+  // data whose shape changed is drift, whatever error member sits next to it
+  const shaped = op({
+    response: {
+      format: "json",
+      extract: "data",
+      shape: { data: "object", "data.a": "string", "data.b": "number", "data.c": "array", "data.d": "string" },
+    },
+  });
+  assert.equal(cls(shaped, json(200, { data: { newField: 42 }, error: { status: "INTERNAL" } })), "drift");
+  // a null target next to an error is the error, not a successful null; a plain null is still ok
+  const nullable = op({ response: { format: "json", extract: "data" } });
+  assert.equal(cls(nullable, json(200, { data: null, error: { code: 503, status: "UNAVAILABLE" } })), "error");
+  assert.equal(cls(nullable, json(200, { data: null })), "ok");
+  // only gRPC's own names count: an inherited property name is no status
+  assert.equal(cls(op(), json(200, { error: { status: "toString" } })), "drift");
+  // a server failure, at the status line or in the body, says so: nothing is learned about the request
+  assert.equal(classify(rpc, status(13)).server, true);
+  assert.equal(classify(op(), json(502, "bad gateway")).server, true);
+  assert.equal(classify(rpc, status(3)).server, undefined);
+  // a write's 200 that carries one was refused, not done
+  assert.equal(cls(op({ readOnly: false, response: { format: "json" } }), status(3)), "error");
+});
+
 test("embedded: missing data is drift, present is ok", () => {
   const emb = op({ response: { format: "embedded", embedded: { regex: "data:(\\[)" } } });
   assert.equal(cls(emb, html(200, "<script>x({data:[1,2]})</script>")), "ok");

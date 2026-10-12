@@ -351,7 +351,7 @@ Every response is classified, never by status code alone:
 
 | class | signals | action |
 |---|---|---|
-| `ok` | 2xx, expected content type, extract path present (an empty list there is a search with no results: `data: []`; for an html recipe whose items selector is `<container> <item>`, the container present with no element of the item's tag), no GraphQL `errors` with null `data` or next to a null extract target; any 2xx to a write | return |
+| `ok` | 2xx, expected content type, extract path present (an empty list there is a search with no results: `data: []`; for an html recipe whose items selector is `<container> <item>`, the container present with no element of the item's tag), no GraphQL `errors` with null `data` or next to a null extract target, no error status in place of the data; any 2xx to a write that carries no error status | return |
 | `drift` | 404/410 on a templated API path, GraphQL "PersistedQueryNotFound"/"must be defined", 400 schema errors, extract path missing, breaking shape change (compared under the extract path; id-keyed maps are `*`) | heal once |
 | `auth` | 401, 400/403/422 with login wording ("Bad Authentication data") or a refused API key ("Invalid Application-ID or API key") or an explicit CSRF failure (token missing/invalid/mismatch, verification failed, InvalidAuthenticityToken; not a page that merely carries a csrf field), a 403 login page, 419, 200 + HTML login page where JSON expected, a sign-in form that embeds a CAPTCHA widget or a vendor script that also rides on ordinary pages (reCAPTCHA on a login page guards the login; an interstitial's own markers still make the page `blocked`), an html/embedded op's page without its data that says "sign in" or shows a sign-in form (a mere Sign-in link, like Google's ServiceLogin button, is not one), a redirect to a login path, `require_login: true`, a trigger that lands on a sign-in page | each step at most once per call, at any tier, a retry that still answers `auth` going on to the next step (a changed analytics cookie changes the request without renewing a token); a write only when it certainly did not run, so never at tier 3: re-import a browser-imported session; then refresh the jar's cookies from the profile, retrying if that changes the request (a tier-2 page sends the profile's cookies itself, so there only a `cookie:` ref counts: an `x-csrf-token` header); for a read with `session:` refs, one trigger run refreshes them and answers; for a write with them, one trigger run with the write intercepted (as when learning it) refreshes them and the write is sent again; for a read whose only credential is one marked public, with no login on record, a heal re-learns it, as for drift (the site rotated its shared bearer); then diagnostic "run `api-anything login <site>`" |
 | `rate` | 429 (with the server's Retry-After), "please wait", "rate limit" | back off, report; no heal |
@@ -359,11 +359,32 @@ Every response is classified, never by status code alone:
 | `input` | 400 with validation error mentioning a param; 404 with the param in the path; a read's 404, empty 2xx or missing data while the example args still answer; a GraphQL not-found; an unknown arg name | return the error to the caller |
 | `error` | anything else (a network error names its cause) | return with details |
 
+An error status a 2xx answer carries in place of its data is judged as the HTTP status it stands
+for: a batchexecute RPC whose payload's place holds `[13]` (`[["wrb.fr",null,null,null,null,[13]]]`),
+`{"error": {"status": "UNAVAILABLE"}}` or `{"error": {"code": 503}}`, a JSON-RPC `error`. gRPC's
+codes go as Google's gateways map them (13 and 2 → 500, 14 → 503, 4 → 504, 8 → 429, 16 → 401, 7 → 403,
+5 → 404, 3, 9 and 11 → 400), JSON-RPC's as a server error (500), a missing method (404) or a bad
+request (400). So a server's own failure is `error`, not drift: it is not healed and marks nothing
+stale. A heal whose trigger page or candidate check gets a server failure (a 5xx, or a status in the
+body that stands for one), or no answer at all (a timeout, a reset, a page that does not load),
+learned nothing either: it stops and marks nothing stale, as for a
+throttled check, and so does an example-args check that gets one. A tier-3 run whose page answered
+a 5xx is that `error` too, and does not switch tier 3 off for a stale op. A read's bad request in the body names no
+param, so it is missing data: the example args tell bad args (`input`: a reversed date range) from a
+template that went stale. Of several RPCs in one answer, the status is the one the extract path
+reads, and none when that RPC is absent. It counts only where the extract target is absent or null, or anywhere when the op has no
+extract path (the body is then the answer): data that is there, its shape changed or not, is judged
+as before, whatever error member sits next to it. An app's own error number
+(`{"error": {"code": 190}}`) and a name that is not gRPC's are not statuses. A write's 2xx that
+carries one was refused.
 Login and rate wording in a 2xx JSON body only counts when the data is missing (Instagram sends
 `require_login: false` on its rate-limit answers). **Missing data is ambiguous**: "no such user"
-and "no results" look exactly like a moved extract path. Before healing a read, the stored
-template is replayed once with the op's example args; if that answers, nothing drifted and the
-call returns `input`. This costs one request instead of a browser run. If that replay is
+and "no results" look exactly like a moved extract path, and so does a server that sometimes
+answers a good request without the data (Google sends its homepage for a valid flight search now
+and then). A read below tier 3 is first sent once more: if that answers, it is the call's answer.
+Then, before healing, the stored template is replayed once with the op's example args; if that
+answers, nothing drifted and the call returns `input`. This costs two requests instead of a browser
+run. If that replay is
 throttled, challenged or logged out, the call stops there with that class and nothing is healed.
 If the examples get no data either and re-learning gives the same request, the response recipe
 drifted (a renamed field): `drift`, with a hint to re-add with a new `--extract`.
@@ -373,7 +394,9 @@ same args filled in) is not drift. An op healed less than 10 minutes ago that fa
 whose heal failed, is marked stale for 30 minutes with a reason, not re-healed. While stale, a read
 still tries its trigger (tier 3), unless the trigger did not answer either. A heal that learned
 nothing about the op (its check was rate limited, challenged or logged out, or another process held
-the browser profile) stops at once and marks nothing stale.
+the browser profile, or no browser is installed for the recapture) stops at once and marks nothing
+stale. A forced `api-anything heal` that re-learns the same template replays it once and reports its
+answer: the same template is no proof the op works.
 
 ## Execution ladder
 
@@ -427,7 +450,20 @@ Heal strategies, cheapest first:
   args (classifier must say `ok` and the extract must resolve). It learns from the call's args with
   defaults filled when they can be located (every param present, 3+ chars, distinct), else from the
   op's examples. A new slot where the arg merely equals the old template's constant there (q=search
-  in /api/search) is dropped; a candidate that loses any param's slot is refused. Values of newly
+  in /api/search) is dropped; a candidate that loses any param's slot is refused. A page fills some places with its
+  own values: a date picker asks for its own range (from the first of the chosen day's month, to a day
+  it picks), so the caller's `start` is only at the chosen day and the caller's `end` nowhere. A param
+  found only at places the op already had (it did not move) keeps its other places too, and a param
+  the trigger has no `{name}` for, whose example the page therefore never sends, keeps all of them.
+  Each kept place must still hold the same kind of value: the same leaf type, the same runs of
+  characters ("2026-10-31" and "2027-05-31" are one kind, "en-US" another, so fields that moved are
+  caught), the param's pattern, no cookie or stored value, and, in an array, the same array around
+  it: as long, with the same value at every position no param fills (a field inserted beside it, or a
+  constant that traded places with it, is caught). One holding another kind, or inside a
+  longer text (a templated slot, which could not be filled with the page's value left beside it),
+  fails the heal: re-add the operation. A param the trigger does give the page, but which the page
+  sent nowhere, means something else now: that fails the heal as before. Adding an op stays strict: there an example the request
+  does not carry is refused, since the param would change nothing. Values of newly
   learned `session:` refs are stored before the check.
 
 A healed template is saved to the user's spec dir only after validation. Every heal is
