@@ -20,8 +20,25 @@ export function parseBody(body: string, xssiPrefix?: string): unknown {
   if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length);
   text = text.trim();
   if (/^\d+[ \t]*\r?\n/.test(text)) return parseChunks(text);
-  const parts = prefix ? text.split(prefix) : [text];
-  return parts.length > 1 ? parts.map((p) => parseJson(p.trim())) : parseJson(text);
+  try {
+    return parseJson(text);
+  } catch (error) {
+    if (!prefix || !text.includes(prefix)) throw error;
+    const parts: unknown[] = [];
+    let at = 0;
+    while (at < text.length) {
+      const end = jsonValueEnd(text, at);
+      parts.push(parseJson(text.slice(at, end)));
+      at = end;
+      while (/\s/.test(text[at] ?? "")) at++;
+      if (at === text.length) break;
+      if (!text.startsWith(prefix, at)) throw error;
+      at += prefix.length;
+      while (/\s/.test(text[at] ?? "")) at++;
+      if (at === text.length) throw error;
+    }
+    return parts;
+  }
 }
 
 function parseChunks(text: string): unknown[] {
@@ -58,7 +75,12 @@ export function innerJson(s: string): unknown {
  */
 export function getPath(obj: unknown, path?: string): unknown {
   if (!path) return obj;
-  const steps = [...path.matchAll(/\[(\d+)\]|\[(\*)\]|\["((?:[^"\\]|\\.)*)"\]|[^.[\]]+/g)];
+  return atPath(obj, pathSteps(path));
+}
+
+const pathSteps = (path: string) => [...path.matchAll(/\[(\d+)\]|\[(\*)\]|\["((?:[^"\\]|\\.)*)"\]|[^.[\]]+/g)];
+
+function atPath(obj: unknown, steps: RegExpMatchArray[]): unknown {
   const walk = (cur: unknown, i: number): unknown => {
     for (; i < steps.length; i++) {
       const m = steps[i]!;
@@ -71,6 +93,7 @@ export function getPath(obj: unknown, path?: string): unknown {
         return cur.length && !found.length ? undefined : found.flat();
       }
       const key = m[1] ?? (m[3] !== undefined ? (JSON.parse(`"${m[3]}"`) as string) : m[0]);
+      if (!Object.hasOwn(cur, key)) return undefined;
       cur = (cur as Record<string, unknown>)[key];
     }
     return cur;
@@ -131,17 +154,24 @@ export function returnedFields(r: Pick<ResponseSpec, "format" | "pick" | "html" 
  * (`publicId=navigationUrl~/in/([^/?]+)`); a non-string or no match drops the field.
  */
 export function pick(value: unknown, paths: string[]): unknown {
-  const named = paths.map(pickEntry);
+  const named = paths.map((p) => {
+    const entry = pickEntry(p);
+    return { ...entry, steps: pathSteps(entry.path) };
+  });
   const one = (item: unknown) => {
     if (!item || typeof item !== "object") return item;
     const out: Record<string, unknown> = {};
-    for (const { name, path, re } of named) {
-      let v = getPath(item, path);
+    for (const { name, steps, re } of named) {
+      let v = atPath(item, steps);
       if (re) {
         const m = typeof v === "string" ? re.exec(v) : null;
         v = m ? (m[1] ?? m[0]) : undefined;
       }
-      if (v !== undefined) out[name] = v;
+      if (v !== undefined) {
+        if (name === "__proto__")
+          Object.defineProperty(out, name, { value: v, enumerable: true, configurable: true, writable: true });
+        else out[name] = v;
+      }
     }
     return out;
   };

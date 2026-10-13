@@ -73,6 +73,53 @@ beforeEach(() => {
   seen = [];
 });
 
+test("different object and array args check the working examples before healing", async () => {
+  for (const [type, example, given] of [
+    ["object", { q: "alice" }, { q: "missing" }],
+    ["array", ["a", "b"], ["a,b"]],
+  ] as const) {
+    for (const status of [200, 403]) {
+      saveSite(
+        parseSite({
+          name: "t",
+          baseUrl: "https://t.test",
+          operations: [
+            {
+              name: "structured",
+              readOnly: true,
+              request: {
+                method: "POST",
+                url: "https://t.test/api/search",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ filter: example }),
+              },
+              slots: [{ param: "filter", at: ["body", "json:/filter"] }],
+              params: [{ name: "filter", type, example }],
+              trigger: { url: "https://t.test/search" },
+              response: { extract: "items" },
+            },
+          ],
+        }),
+      );
+      const sent: unknown[] = [];
+      const r = await call(
+        "t",
+        "structured",
+        { filter: given },
+        opts((_url, init) => {
+          const filter = JSON.parse(init?.body as string).filter;
+          sent.push(filter);
+          return JSON.stringify(filter) === JSON.stringify(example) ? json({ items: [example] }) : json({}, status);
+        }),
+      );
+      assert.equal(r.class, "input", JSON.stringify(r));
+      assert.deepEqual(sent.at(-1), example);
+      assert.equal(sent.length, status === 200 ? 3 : 2);
+      assert.equal(heals().length, 0);
+    }
+  }
+});
+
 test("writes: refused without allowWrites; 5xx and network errors are ambiguous and never retried", async () => {
   assert.equal(
     (

@@ -1,6 +1,6 @@
 /** Classify every response, never by status code alone. See DESIGN.md "Failure classifier". */
 import { parse as parseHtml } from "node-html-parser";
-import { extract, extractHtml, getPath, inferShape, parseBody } from "./extract.js";
+import { extract, extractHtml, getPath, inferShape, parseBody, pick } from "./extract.js";
 import type { Operation } from "./spec.js";
 
 export type Class = "ok" | "drift" | "auth" | "rate" | "blocked" | "input" | "error";
@@ -300,7 +300,11 @@ function inBandError(data: unknown, extract?: string): { status: number; said: s
 }
 
 /** Learned shape and value, scoped to the extract path when it resolves: other subtrees may come and go. */
-function shapeScope(op: Operation, data: unknown): { expected: Record<string, string>; value: unknown } {
+function shapeScope(
+  op: Operation,
+  data: unknown,
+  target: unknown,
+): { expected: Record<string, string>; value: unknown } {
   const shape = op.response.shape ?? {};
   const ex = op.response.extract;
   if (!ex) return { expected: shape, value: data };
@@ -317,7 +321,7 @@ function shapeScope(op: Operation, data: unknown): { expected: Record<string, st
     else if (k.startsWith(`${prefix}.`)) expected[k.slice(prefix.length + 1)] = t;
     else if (k.startsWith(`${prefix}[]`)) expected[k.slice(prefix.length)] = t;
   }
-  return { expected, value: getPath(data, ex) };
+  return { expected, value: target };
 }
 
 /** Share of the learned shape still present with the same type; null matches anything. */
@@ -345,6 +349,15 @@ function mentionsParam(op: Operation, body: string): boolean {
 }
 
 export function classify(op: Operation, r: Observed): Classified {
+  return classifyResponse(op, r, () => parseBody(r.body ?? "", op.response.xssiPrefix));
+}
+
+function classifyResponse(
+  op: Operation,
+  r: Observed,
+  readJson: () => unknown,
+  readTarget = (data: unknown) => getPath(data, op.response.extract),
+): Classified {
   const body = r.body ?? "";
   const ct = (r.headers["content-type"] ?? "").toLowerCase();
   const isHtml = ct.includes("html") || /^\s*<(!doctype|html)/i.test(body);
@@ -400,7 +413,7 @@ export function classify(op: Operation, r: Observed): Classified {
 
   let data: unknown;
   try {
-    data = parseBody(body, op.response.xssiPrefix);
+    data = readJson();
   } catch {
     if (!op.readOnly) {
       if (isHtml && !/html/i.test(op.response.contentType ?? "") && signInForm(body))
@@ -419,7 +432,7 @@ export function classify(op: Operation, r: Observed): Classified {
   const errors = d && typeof d === "object" && Array.isArray(d.errors) && d.errors.length ? d.errors : undefined;
   if (errors && d!.data == null) return graphqlErrors(errors, " with null data");
   // Partial data: errors next to a null target (a rate limit, a not-found user) are the answer, not a successful null.
-  if (errors && op.response.extract && getPath(data, op.response.extract) == null)
+  if (errors && op.response.extract && readTarget(data) == null)
     return graphqlErrors(errors, ` and a null "${op.response.extract}"`);
   // An error status in the body is judged as that status: a server's own failure is not moved data.
   const inBand = () => {
@@ -447,12 +460,11 @@ export function classify(op: Operation, r: Observed): Classified {
   }
 
   // An empty list where the results go is a search with no results, not missing data.
-  const target = op.response.extract ? getPath(data, op.response.extract) : data;
+  const target = readTarget(data);
   if (Array.isArray(target) && !target.length) return ok("no results");
   let gone: string | undefined;
-  const scope = op.response.shape ? shapeScope(op, data) : undefined;
-  if (op.response.extract && getPath(data, op.response.extract) === undefined)
-    gone = `extract path "${op.response.extract}" missing`;
+  const scope = op.response.shape ? shapeScope(op, data, target) : undefined;
+  if (op.response.extract && target === undefined) gone = `extract path "${op.response.extract}" missing`;
   else if (scope && Object.keys(scope.expected).length >= 4 && shapeKept(scope.expected, scope.value) < 0.5) {
     gone = "response shape changed (under half of the learned key paths remain)";
   }
@@ -477,15 +489,35 @@ export interface Judged extends Classified {
 
 /** classify, then extract when ok. Never throws: a bad selector or regex in the spec is an error. */
 export function judge(op: Operation, r: Observed): Judged {
+  let parsed: unknown;
+  let read = false;
+  let target: unknown;
+  let selected = false;
+  const readJson = () => {
+    if (!read) {
+      parsed = parseBody(r.body ?? "", op.response.xssiPrefix);
+      read = true;
+    }
+    return parsed;
+  };
+  const readTarget = (data: unknown) => {
+    if (!selected) {
+      target = getPath(data, op.response.extract);
+      selected = true;
+    }
+    return target;
+  };
   let c: Classified;
   try {
-    c = classify(op, r);
+    c = classifyResponse(op, r, readJson, readTarget);
   } catch (e) {
     return is("error", `the op's response recipe failed: ${(e as Error).message}`);
   }
   if (c.class !== "ok") return c;
   try {
-    return { ...c, data: extract(op.response, r.body) };
+    if (op.response.format !== "json") return { ...c, data: extract(op.response, r.body) };
+    const data = readTarget(readJson());
+    return { ...c, data: data !== undefined && op.response.pick?.length ? pick(data, op.response.pick) : data };
   } catch (e) {
     // a write's non-JSON answer: hand back its text
     if (!op.readOnly) return { ...c, data: r.body.trim() ? r.body.slice(0, 1000) : null };

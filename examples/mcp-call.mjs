@@ -19,7 +19,7 @@ try {
   console.log("call_operation", JSON.stringify({ site, op, args }));
   const res = await client.callTool({ name: "call_operation", arguments: { site, op, args } });
   const r = JSON.parse(res.content[0].text);
-  // call_operation sends a list of records as {columns, rows}; turn it back into objects to print.
+  // Economical tables arrive as {columns, rows}; turn them back into records to print.
   const items = r.data?.columns
     ? r.data.rows.map((row) => Object.fromEntries(r.data.columns.map((c, i) => [c, row[i]])))
     : [].concat(r.data ?? []);

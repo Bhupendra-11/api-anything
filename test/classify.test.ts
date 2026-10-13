@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classify, type Observed } from "../src/classify.js";
+import { classify, judge, type Observed } from "../src/classify.js";
 import { type Operation, OperationSchema } from "../src/spec.js";
 
 const op = (over: Record<string, unknown> = {}): Operation =>
@@ -26,6 +26,60 @@ const html = (status: number, body: string): Observed => ({
   body,
 });
 const cls = (o: Operation, r: Observed) => classify(o, r).class;
+
+test("judge classifies raw JSON before projection and shares only its own call's data", () => {
+  const operation = op({ response: { format: "json", extract: "data.user", pick: ["id", "name"] } });
+  const first = judge(operation, json(200, '{"data":{"user":{"id":9007199254740993,"name":"first"}}}'));
+  assert.deepEqual(first, { class: "ok", reason: "ok", data: { id: "9007199254740993", name: "first" } });
+  assert.deepEqual(judge(operation, json(200, { data: { user: { id: 2, name: "second" } } })), {
+    class: "ok",
+    reason: "ok",
+    data: { id: 2, name: "second" },
+  });
+  assert.equal(
+    judge(operation, json(200, { data: { user: null }, errors: [{ message: "login_required" }] })).class,
+    "auth",
+  );
+  assert.equal(judge(operation, json(200, { error: { status: "UNAVAILABLE" } })).class, "error");
+  assert.equal(judge(operation, json(200, { data: { other: [] } })).class, "drift");
+});
+
+test("valid XSSI text is data rather than drift", () => {
+  const operation = op({ response: { format: "json", xssiPrefix: "for (;;);", extract: "data.user" } });
+  assert.deepEqual(judge(operation, json(200, 'for (;;);{"data":{"user":{"name":"for (;;);"}}}')), {
+    class: "ok",
+    reason: "ok",
+    data: { name: "for (;;);" },
+  });
+});
+
+test("an inherited object member never stands in for missing response data", () => {
+  for (const extract of ["toString", "constructor", "__proto__"]) {
+    const operation = op({ response: { format: "json", extract } });
+    assert.equal(judge(operation, json(200, "{}")).class, "drift");
+    assert.deepEqual(judge(operation, json(200, `{"${extract}":42}`)), { class: "ok", reason: "ok", data: 42 });
+  }
+});
+
+test("judge resolves JSON-in-string targets per call and retains the selected RPC's status", () => {
+  const operation = op({ response: { format: "json", extract: "[1][2].items", pick: ["id"] } });
+  const response = (payload: string | null, status?: number) =>
+    json(200, [
+      ["wrb.fr", "other", null, null, null, [8]],
+      ["wrb.fr", "target", payload, null, null, status === undefined ? null : [status]],
+    ]);
+  assert.deepEqual(judge(operation, response('{"items":[{"id":9007199254740993}]}')), {
+    class: "ok",
+    reason: "ok",
+    data: [{ id: "9007199254740993" }],
+  });
+  assert.deepEqual(judge(operation, response('{"items":[{"id":2}]}')).data, [{ id: 2 }]);
+  assert.deepEqual(judge(operation, response('{"items":null}')), { class: "ok", reason: "ok", data: null });
+  assert.equal(judge(operation, response("{}")).class, "drift");
+  assert.equal(judge(operation, response(null, 13)).server, true);
+  assert.equal(judge(operation, json(200, [["wrb.fr", "other", null, null, null, [8]]])).class, "drift");
+  assert.equal(judge(op(), json(200, { data: '{"user":null}', errors: [{ message: "rate limit" }] })).class, "rate");
+});
 
 test("ok: 2xx JSON with the extract path present", () => {
   assert.deepEqual(classify(op(), json(200, { data: { user: { name: "NASA" } } })), { class: "ok", reason: "ok" });

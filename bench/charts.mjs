@@ -20,7 +20,12 @@ const median = (xs) => {
     m = s.length >> 1;
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
-const stats = (xs) => ({ n: xs.length, median: median(xs), min: Math.min(...xs), max: Math.max(...xs) });
+const stats = (xs) => {
+  const measured = xs.filter(Number.isFinite);
+  return measured.length
+    ? { n: measured.length, median: median(measured), min: Math.min(...measured), max: Math.max(...measured) }
+    : { n: 0, median: null, min: null, max: null };
+};
 
 // An answer is correct when each date's quoted price matches the snapshot taken right after that
 // trial. Ties make the airline ambiguous, so only the price is graded. A batch without per-trial
@@ -56,15 +61,21 @@ function correct(task, answer, truth) {
   });
 }
 
-const trials = lines(join(res, "trials.jsonl"))
-  .filter((t) => t.code === 0)
-  .map((t) => ({ ...t, correct: t.truth ? correct(t.task, t.answer, t.truth) : null }));
+const trials = lines(join(res, "trials.jsonl")).map((t) => ({
+  ...t,
+  correct: t.code === 0 && t.truth ? correct(t.task, t.answer ?? "", t.truth) : null,
+}));
 const transport = lines(join(res, "transport.jsonl"));
 const summary = { agents: {}, transport: {} };
 for (const task of [...new Set(trials.map((t) => t.task))]) {
   for (const arm of ["browser", "api"]) {
     const ts = trials.filter((t) => t.task === task && t.arm === arm);
     summary.agents[`${task}/${arm}`] = {
+      attempts: ts.length,
+      completed: ts.filter((t) => t.code === 0).length,
+      failed: ts.filter((t) => t.code !== 0).length,
+      graded: ts.filter((t) => t.correct !== null).length,
+      ungraded: ts.filter((t) => t.correct === null).length,
       correct: ts.every((t) => t.correct !== null) ? ts.filter((t) => t.correct).length : "not graded",
       seconds: stats(ts.map((t) => t.wallMs / 1000)),
       costUsd: stats(ts.map((t) => t.costUsd)),
@@ -119,8 +130,13 @@ function barPanel(c, x0, y0, w, { title, rows, fmt, max }) {
   for (const row of rows) {
     out += `<text x="${x0}" y="${y + bar + gap / 2 + 4}" fill="${c.text2}" font-size="13">${esc(row.label)}</text>`;
     for (const arm of ["browser", "api"]) {
-      const s = row[arm],
-        x1 = sx(s.median),
+      const s = row[arm];
+      if (!s.n) {
+        out += `<text x="${x0 + labelW + 8}" y="${y + bar - 3}" fill="${c.muted}" font-size="13">N/A (no measurement)</text>`;
+        y += bar + gap;
+        continue;
+      }
+      const x1 = sx(s.median),
         bx = x0 + labelW,
         r = Math.min(4, x1 - bx);
       out += `<path d="M${bx},${y} H${x1 - r} a${r},${r} 0 0 1 ${r},${r} V${y + bar - r} a${r},${r} 0 0 1 ${-r},${r} H${bx} Z" fill="${c[arm]}"><title>${arm === "api" ? "API Anything" : "Browser"}: median ${fmt(s.median)}, range ${fmt(s.min)}-${fmt(s.max)}, n=${s.n}</title></path>`;
@@ -174,7 +190,8 @@ for (const [mode, c] of draw ? Object.entries(THEMES) : []) {
   if (tasks.length) {
     const rows = (k) =>
       tasks.map((t) => ({ label: taskLabel[t], browser: A[`${t}/browser`][k], api: A[`${t}/api`][k] }));
-    const maxOf = (k) => Math.max(...tasks.flatMap((t) => [A[`${t}/browser`][k].max, A[`${t}/api`][k].max]));
+    const maxOf = (k) =>
+      Math.max(1e-9, ...tasks.flatMap((t) => [A[`${t}/browser`][k].max ?? 0, A[`${t}/api`][k].max ?? 0]));
     const time = barPanel(c, 24, 56, 440, {
       title: "Time to answer",
       rows: rows("seconds"),
@@ -187,14 +204,19 @@ for (const [mode, c] of draw ? Object.entries(THEMES) : []) {
       fmt: (v) => `$${v.toFixed(3)}`,
       max: maxOf("costUsd"),
     });
-    const n = A[`${tasks[0]}/api`].seconds.n,
-      h = Math.max(time.bottom, cost.bottom) + 46;
+    const attempted = trials.filter((t) => tasks.includes(t.task));
+    const checked = attempted.filter((t) => t.correct !== null).length;
+    const check =
+      checked === attempted.length
+        ? CHART.check
+        : `${checked} of ${attempted.length} attempts graded; failures and missing snapshots remain ungraded.`;
+    const h = Math.max(time.bottom, cost.bottom) + 46;
     const body =
       legend(c, 24, 30) +
       time.svg +
       cost.svg +
-      `<text x="24" y="${h - 32}" fill="${c.muted}" font-size="12">Bar = median of ${n} runs, line = range. ${esc(CHART.task)}</text>` +
-      `<text x="24" y="${h - 14}" fill="${c.muted}" font-size="12">Claude Opus 5.5 in Claude Code, same prompt. Cost as reported by Claude Code at API rates. ${esc(CHART.check)}</text>`;
+      `<text x="24" y="${h - 32}" fill="${c.muted}" font-size="12">Bar = median of measured runs, line = range; sample counts in bar titles. ${esc(CHART.task)}</text>` +
+      `<text x="24" y="${h - 14}" fill="${c.muted}" font-size="12">Claude Opus 5.5, same prompt. Cost at API rates. ${esc(check)}</text>`;
     writeFileSync(
       join(media, `${CHART.file}-${mode}.svg`),
       svg(952, h, body, c, "Agent time and cost per task, browser versus API Anything"),

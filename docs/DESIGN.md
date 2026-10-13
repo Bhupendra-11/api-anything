@@ -675,7 +675,9 @@ independent alternative.
   `login` tool) instead of CLI commands, and tells the agent to run a CLI-only one (heal, add) in its
   own shell, or to hand it to the user when it has none.
   `call_operation` sends `data` that is a list of two or more records as `{columns, rows}` (a
-  missing field is null): the keys, repeated in every item, were half of a flight search's tokens.
+  missing field is null) when that makes the JSON smaller. A sparse table can be larger than the
+  original records, so those stay a list to preserve the output cap. The keys, repeated in every
+  item, were half of a flight search's tokens.
 - **Skill** `skills/api-anything/SKILL.md`: the create loop (capture → add → call → verify), the
   strict failure loop (follow `next` at most once, then stop and report), and the safety rules.
 - **Claude Code plugin** manifest (skill + MCP), plus copy-paste install lines for Codex and other agents.

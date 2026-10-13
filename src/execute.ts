@@ -12,6 +12,7 @@ import {
   profileCookies,
 } from "./browser.js";
 import { type Class, judge } from "./classify.js";
+import { asText } from "./codec.js";
 import { capOutput } from "./extract.js";
 import {
   type Attempt,
@@ -125,7 +126,7 @@ function exampleArgs(op: Operation): Record<string, unknown> | undefined {
 }
 
 const sameArgs = (a: Record<string, unknown>, b: Record<string, unknown>, op: Operation) =>
-  op.params.every((p) => String(a[p.name] ?? p.default ?? "") === String(b[p.name] ?? p.default ?? ""));
+  op.params.every((p) => asText(a[p.name] ?? p.default ?? "") === asText(b[p.name] ?? p.default ?? ""));
 
 /** Never throws: a browser that fails to launch or a page that fails to load is a failed heal. */
 const safeHeal = (p: Promise<HealResult>): Promise<HealResult> =>

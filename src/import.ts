@@ -180,11 +180,13 @@ interface Candidate {
 }
 
 /** Every profile of every browser that holds at least one cookie for the site's registrable domain. */
-function candidatesFor(site: string): Candidate[] {
+function candidatesFor(site: string, pin?: ImportPin): Candidate[] {
   const out: Candidate[] = [];
   for (const root of browserRoots()) {
+    if (pin?.browser && root.name.toLowerCase() !== pin.browser.toLowerCase()) continue;
     if (root.family === "firefox") {
       for (const entry of safeReaddir(root.root)) {
+        if (pin && entry !== pin.profile) continue;
         const db = join(root.root, entry, "cookies.sqlite");
         if (!existsSync(db)) continue;
         const names = firefoxNames(db, site);
@@ -193,6 +195,7 @@ function candidatesFor(site: string): Candidate[] {
       continue;
     }
     for (const entry of safeReaddir(root.root)) {
+      if (pin && entry !== pin.profile) continue;
       const profileDir = join(root.root, entry);
       const db = chromiumCookieDb(profileDir);
       if (!db) continue;
@@ -344,9 +347,6 @@ export function parsePin(text: string): ImportPin {
   return { browser: text.slice(0, i), profile: text.slice(i + 1) };
 }
 
-const matchesPin = (c: Candidate, pin: ImportPin) =>
-  c.profile === pin.profile && (!pin.browser || c.browser.toLowerCase() === pin.browser.toLowerCase());
-
 /** A chromium profile's display name and signed-in Google account, from the browser's "Local State". */
 function profileInfo(c: Candidate): { name?: string; email?: string } {
   if (c.family !== "chromium") return {};
@@ -374,14 +374,11 @@ export function importFromBrowsers(o: {
   pin?: ImportPin;
 }): ImportedSession | undefined {
   const site = siteOf(new URL(o.url).hostname.toLowerCase());
-  let candidates = candidatesFor(site);
-  if (o.pin) {
-    candidates = candidates.filter((c) => matchesPin(c, o.pin!));
-    if (!candidates.length)
-      throw new Error(
-        `no browser profile "${o.pin.browser ? `${o.pin.browser}/` : ""}${o.pin.profile}" has cookies for ${site}`,
-      );
-  }
+  const candidates = candidatesFor(site, o.pin);
+  if (o.pin && !candidates.length)
+    throw new Error(
+      `no browser profile "${o.pin.browser ? `${o.pin.browser}/` : ""}${o.pin.profile}" has cookies for ${site}`,
+    );
   const signedIn = candidates.filter((c) =>
     o.loginCookies?.length
       ? o.loginCookies.every((n) => c.names.has(n))

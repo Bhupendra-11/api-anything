@@ -1,5 +1,19 @@
 # Benchmark: an agent with a browser vs the same agent with API Anything
 
+## Offline engine latency
+
+`node --import tsx bench/engine.mjs` measures response judging, picking, capping, outlining,
+request filling, localhost calls, and cold compiled CLI calls. Build first. `--repo <snapshot>`
+compares another checkout or an archived baseline; pass `--revision <commit>` for an archive
+without Git metadata. `--only cli-cold-localhost` isolates startup. Results include the source
+hash and median batch latency; `p95BatchMeanMs` is not an individual-call tail percentile.
+
+`node --import tsx bench/import.mjs` measures a pinned import from disposable synthetic browser
+databases. Both scripts assert their results and use no real accounts or live websites. See
+[the audit](../docs/PERFORMANCE-AUDIT.md) for the before/after protocol and measured limits.
+
+## Live agent comparison
+
 One Claude Code agent gets the same prompt twice. In one run it has only a browser (Playwright
 MCP on headless Chrome). In the other it has only API Anything's MCP server with the bundled
 `google-flights` operations. The same model, settings and prompt are used in both, with fresh

@@ -14,6 +14,14 @@ import {
 } from "../src/extract.js";
 import { ResponseSchema } from "../src/spec.js";
 
+test("pick preserves an own __proto__ field without changing the output prototype", () => {
+  const data = JSON.parse('{"__proto__":{"id":1},"name":"record"}');
+  const result = pick(data, ["__proto__", "name"]) as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(result), Object.prototype);
+  assert.ok(Object.hasOwn(result, "__proto__"));
+  assert.equal(JSON.stringify(result), '{"__proto__":{"id":1},"name":"record"}');
+});
+
 test("returnedFields: the keys a result item carries, from the pick or an HTML recipe's fields", () => {
   assert.deepEqual(
     returnedFields({ format: "json", pick: ["bookId", "author=author.name", "id=url~/show/(\\d+)", "node.code"] }),
@@ -33,6 +41,37 @@ test("parseBody strips XSSI and keeps big integers exact", () => {
   assert.throws(() => parseBody("<html>"));
 });
 
+test("XSSI markers inside data survive, including between repeated prefixed payloads", () => {
+  for (const prefix of [")]}'", "for (;;);", "while(1);"]) {
+    const first = { text: `${prefix} ordinary page text`, nested: [prefix] };
+    const second = { text: `another ${prefix} literal` };
+    assert.deepEqual(parseBody(prefix + JSON.stringify(first)), first);
+    assert.deepEqual(parseBody(`${prefix}${JSON.stringify(first)}\n${prefix}\n${JSON.stringify(second)}`), [
+      first,
+      second,
+    ]);
+    for (const tail of [prefix, `${prefix}{`, `${prefix}{"bad":}`, `garbage${prefix}{}`])
+      assert.throws(() => parseBody(prefix + JSON.stringify(first) + tail));
+  }
+});
+
+test("pick reuses paths across rows without retaining row data or wildcard state", () => {
+  const rows = [
+    { payload: '{"x.y":[{"value":"one"},{"value":"two"}]}', url: "/item/123" },
+    { payload: '{"x.y":[{}, {"value":null}]}', url: "/item/456" },
+    { payload: '{"x.y":[{}]}', url: "missing" },
+  ];
+  const recipe = ['values=payload["x.y"][*].value', "id=url~/item/(\\d+)"];
+  assert.deepEqual(pick(rows, recipe), [
+    { values: ["one", "two"], id: "123" },
+    { values: [null], id: "456" },
+  ]);
+  assert.deepEqual(pick(rows.slice().reverse(), recipe), [
+    { values: [null], id: "456" },
+    { values: ["one", "two"], id: "123" },
+  ]);
+});
+
 test("parseBody reads Google rt=c length-prefixed chunks", () => {
   const body = ')]}\'\n\n27\n[["wrb.fr",null,"[1,2]"]]\n12\n[["di",42]]\n';
   assert.deepEqual(parseBody(body), [[["wrb.fr", null, "[1,2]"]], [["di", 42]]]);
@@ -48,6 +87,17 @@ test("getPath: dots, brackets, index-only paths, dashed keys, quoted keys", () =
   assert.equal(getPath(o.arr, "[0][1][1]"), 6);
   assert.equal(getPath(o, "a.missing.c"), undefined);
   assert.equal(getPath("str", "length"), undefined);
+});
+
+test("getPath reads own JSON fields, never inherited object properties", () => {
+  for (const name of ["toString", "constructor", "__proto__"]) {
+    assert.equal(getPath({}, name), undefined);
+    assert.equal(getPath({ items: [{}] }, `items[*].${name}`), undefined);
+    const own = JSON.parse(`{"${name}":{"value":42}}`);
+    assert.equal(getPath(own, `${name}.value`), 42);
+  }
+  assert.equal(getPath(["first", "second"], "length"), 2);
+  assert.equal(getPath(["first", "second"], "[1]"), "second");
 });
 
 test("getPath [*]: results split across sections (an ad section first) are all collected", () => {

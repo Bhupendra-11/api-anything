@@ -6,16 +6,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
-import {
-  type BrowserContext,
-  type Cookie,
-  chromium,
-  type Frame,
-  type Page,
-  type Request,
-  type Response,
-  type Route,
-} from "playwright-core";
+import type { BrowserContext, Cookie, chromium, Frame, Page, Request, Response, Route } from "playwright-core";
 import { botWall } from "./classify.js";
 import { home, siteOf, writePrivate } from "./session.js";
 import type { Request as Hop } from "./spec.js";
@@ -73,6 +64,7 @@ async function launch(
   profileDir: string,
   options: Parameters<typeof chromium.launchPersistentContext>[1],
 ): Promise<BrowserContext> {
+  const { chromium } = await import("playwright-core");
   const until = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     try {
@@ -199,6 +191,7 @@ export const browserAvailable = (): boolean => !!browserChoice();
 // Default headless UA says "HeadlessChrome/<v>" and x.com answers 403. sec-ch-ua already
 // carries the browser's name, so only the UA string needs the fix.
 async function probeHeadlessUA(): Promise<string> {
+  const { chromium } = await import("playwright-core");
   const b = await chromium.launch({ executablePath: browserChoice()?.bin, headless: true });
   try {
     const p = await b.newPage();
@@ -423,10 +416,10 @@ async function guardSockets(ctx: BrowserContext, guard: SocketGuard): Promise<()
 // How long a page gets to be emptied, and then to close, before the run ends without waiting for it.
 const SEAL_MS = 5000;
 /** A call into a page, given up on after a while: a hung renderer answers nothing, and evaluate() and close() have no timeout. */
-const within = <T>(p: Promise<T>, otherwise: T): Promise<T> => {
+const within = <T>(p: Promise<T>, otherwise: T, ms = SEAL_MS): Promise<T> => {
   let timer: NodeJS.Timeout | undefined;
   const late = new Promise<T>((r) => {
-    timer = setTimeout(() => r(otherwise), SEAL_MS);
+    timer = setTimeout(() => r(otherwise), ms);
   });
   // cleared when the call settles first: a timer left running keeps the process alive for its 5 s
   return Promise.race([p.catch(() => otherwise), late]).finally(() => clearTimeout(timer));
@@ -1103,7 +1096,11 @@ async function redirectOf(seen: Response[], hop: Hop, url: string) {
 /** A page on `origin` to fetch from: its root, or a blank stand-in when the root redirects elsewhere (api.* to www). */
 async function originPage(ctx: BrowserContext, origin: string, left: () => number): Promise<Page> {
   let page = originPages.get(origin);
-  if (page && !page.isClosed()) return page;
+  if (page && !page.isClosed()) {
+    if (new URL(page.url()).origin === origin) return page;
+    await within(page.close(), undefined, Math.min(SEAL_MS, left()));
+    if (left() <= 1) throw new Error("the origin page could not be replaced before the call's deadline");
+  }
   page = await ctx.newPage();
   await page.goto(origin, { waitUntil: "domcontentloaded", timeout: left() }).catch(() => {});
   let here = "";

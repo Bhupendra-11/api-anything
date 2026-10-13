@@ -49,8 +49,8 @@ const idLike = (k: string) => /\d{3,}|[:/]/.test(k);
 function findPaths(root: unknown, values: string[], max = 5): string[] {
   const out: string[] = [];
   const queue: { v: unknown; path: string; depth: number }[] = [{ v: root, path: "", depth: 0 }];
-  while (queue.length && out.length < max) {
-    const { v, path, depth } = queue.shift()!;
+  for (let head = 0; head < queue.length && out.length < max; head++) {
+    const { v, path, depth } = queue[head]!;
     if (typeof v === "string") {
       const inner = innerJson(v);
       if (inner && typeof inner === "object") queue.push({ v: inner, path, depth });

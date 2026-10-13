@@ -18,6 +18,8 @@ const { values: v } = parseArgs({
   },
 });
 if (!v.name || !v.prompt) throw new Error("usage: --name <run> --prompt <file> [--site <name>]");
+if (!/^[a-z0-9][a-z0-9._-]*$/i.test(v.name) || v.name.includes(".."))
+  throw new Error("--name must be a run name without path separators or '..'");
 
 const state = join(repo, "bench/explore/state", v.name),
   out = join(repo, "bench/explore/results", v.name);

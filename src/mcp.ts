@@ -41,14 +41,25 @@ export function mcpNext(next: string): string {
 
 /**
  * A list of records repeats every key in every item, which an agent pays for in tokens. Over MCP
- * such a list is sent once-per-key as `{columns, rows}`; a missing field is null. Anything else,
- * including a list with one item, is sent as is.
+ * such a list is sent once-per-key as `{columns, rows}`; a missing field is null. A table that
+ * would grow the JSON is kept as records, as is anything else, including a list with one item.
  */
 export function asTable(data: unknown): unknown {
   const isRecord = (x: unknown): x is Record<string, unknown> => !!x && typeof x === "object" && !Array.isArray(x);
   if (!Array.isArray(data) || data.length < 2 || !data.every(isRecord)) return data;
-  const columns = [...new Set(data.flatMap((x) => Object.keys(x)))];
-  return { columns, rows: data.map((x) => columns.map((c) => (c in x ? x[c] : null))) };
+  const keys = new Set<string>();
+  let fields = 0;
+  for (const record of data) {
+    const names = Object.keys(record);
+    fields += names.length;
+    for (const name of names) keys.add(name);
+  }
+  const sourceSize = JSON.stringify(data).length;
+  // Missing fields alone can exceed the capped answer; do not allocate that dense matrix.
+  if ((data.length * keys.size - fields) * 4 > sourceSize) return data;
+  const columns = [...keys];
+  const table = { columns, rows: data.map((x) => columns.map((c) => (Object.hasOwn(x, c) ? x[c] : null))) };
+  return JSON.stringify(table).length < sourceSize ? table : data;
 }
 
 const reply = (v: unknown, isError = false) => ({
@@ -148,7 +159,7 @@ export function createServer({ allowWrites = false }: { allowWrites?: boolean } 
     "call_operation",
     {
       description:
-        "Call a site operation. Returns {ok, class, data, tier, healed?, ms, reason?, next?}; a list of two or more records comes back as data {columns, rows} (one row per item, null for a missing field); a one-item list stays a list. `reason` also explains a slow success. On failure follow `next` at most once, then stop and report." +
+        "Call a site operation. Returns {ok, class, data, tier, healed?, ms, reason?, next?}; a list of two or more records comes back as data {columns, rows} when that shortens the JSON (one row per item, null for a missing field); otherwise it stays a list. `reason` also explains a slow success. On failure follow `next` at most once, then stop and report." +
         (allowWrites
           ? " Write operations change the user's account: only call them when the user asked for that exact action."
           : " Writes are disabled on this server."),
