@@ -141,7 +141,16 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    quote-stripped, or URL-decoded; ≥ 8 chars) becomes a `cookie:` ref. Capture also snapshots the
    final page origin's localStorage and sessionStorage; a leaf equal to a stored value (or to a
    string inside a JSON entry, as auth SDKs keep tokens; ≥ 8 chars) becomes a `session:` ref named
-   after the storage key. The leaf's own name changes none of this: under a persisted-query key (`sha256Hash`,
+   after the storage key and the JSON keys under it. A ref's name reaches the spec, so each `/`-separated
+   part of one that holds a live value itself (a key scoped by the org id a cookie carries) becomes a short
+   hash of that part, and a value spread over two parts hashes the name whole. The hash keeps an exact copy of
+   the value out of the spec and does no more than that: it is not anonymity, since a low-entropy id (an
+   incrementing one, a known org) is recovered by hashing a guess. The hash is of the key alone, so a recapture
+   of the same page names the same ref while the live values the name was checked against are unchanged; a part
+   that holds none stays as the page wrote it. Those values rotate, so the same key can become hashed, or stop
+   being hashed, in a later learn or heal; a stored spec keeps the names it has, because a refresh reads each
+   value at its slot's position and stores it under that slot's own ref name. A ref's per-position
+   collision suffix is checked the same way. The leaf's own name changes none of this: under a persisted-query key (`sha256Hash`,
    `doc_id`, `queryId`, `hash`) a cookie or stored value is a ref as anywhere else, whole or inside the leaf, since a
    token the page stores and sends as `queryId` reads exactly like a query id it caches there. So a query id the app
    keeps in storage is a `session:` ref too; only one that is in no cookie and no storage stays a volatile anchor. A key or header named like a credential (its words: token, secret, key,
@@ -197,7 +206,8 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    for different tokens that share a name: one name never means two values, wherever the second was
    found (a storage entry called `token` inside `v1:<value>`, next to a `token` field holding another). All discovered credentials participate in compound-copy
    removal. Learning ends with one check behind all of these rules: the save-time secret scan, run over the stored
-   request and the slot templates. It looks for credentials, not for everything live: every cookie (the jar's and
+   request, the slot templates and the slots' ref names, so a name that still carries a live value fails the learn
+   rather than first the save. It looks for credentials, not for everything live: every cookie (the jar's and
    the request's own Cookie header); the `session:` values that are credentials (found by name or as issued, stored as
    one, or sent under a credential's name), those of refs dropped from inside a container sent whole included; and
    the stored values that are credentials, whether or not anything made them refs. One exception, in this check only: a
@@ -209,8 +219,36 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    (a theme, a locale) is not looked for, also when a leaf that equals it made it a ref: a ref keeps a value fresh,
    it does not make it secret. A copy no rule could turn into a ref (too short to template, base64, percent-encoded
    twice) fails the learn, closed, and the error names the leaf that holds it. No name exempts a leaf, one marked
-   public included; exempt is only the caller's own example, for stored values. Add and heal
-   run the scan again before saving, against the site's whole session (every stored session value, settings too), and refuse to save any spec that still contains one.
+   public included; exempt is only the caller's own example, for stored values. Add, heal and export
+   run the scan again, against the site's cookies and the session values that are credentials, and refuse to save
+   or share any spec that still contains one. Which values those are is learning's own classification, not a guess
+   at save time: a learn records what each name it stored holds (`kinds` in the session file) and a setting is not
+   looked for. A setting is a stored value related to no credential that learn saw, which is more than it stores (a
+   cookie the request sent, a storage entry no leaf repeated): by save time those texts are gone, so the four tests
+   below are asked at classification time too, against all of them. Related through another value the learn saw
+   counts as related: a live value that is no JSON container is entered as a setting of its own, so the chain
+   reaches the stored name even where no single step holds both of its ends. A container is no such link -- a
+   credential and a leaf beside it inside one are siblings, not copies of each other. A credential classification is never undone by a
+   later learn, and a name no learn classified, one a session file written before the field or a refused add left
+   behind, is scanned like a credential until one does.
+   So is a setting whose value changed outside a learn: a refresh (a trigger run, a recapture) rereads each value at
+   its slot's position without classifying it, and the page can put anything there. A recorded setting is left out of the scan only when
+   all four hold: it is no JSON container (a container carries credentials whose own refs were dropped for it, and
+   a refresh can put a new one in); its own text is not random-looking and not shaped like a token (a JWT, a
+   bearer, a long hex or base64 blob); nothing protected holds it, in any encoding the scan reads (a theme also
+   sent as the bearer is a copy of that bearer); and it holds nothing protected itself. Protected is every cookie
+   and every session value that is not itself a candidate to be left out: a credential classification of the same
+   bytes wins, here and in what a learn records. A setting that loses its exemption is protected in turn, and the last two tests are asked again
+   against it until nothing more is protected: the scan reads a few decoding layers, so a chain of settings would
+   otherwise carry a credential further than any one of them can. No cookie is ever a setting. What protects a
+   setting is a relationship between live values, which a later write can take apart, so it is not left to be
+   recomputed: every write of the session file records as a credential each setting this scan keeps, in what was
+   stored and in what is being stored, and a credential is sticky. A write hands back what it recorded, and the add
+   that asked for it scans the op it is saving with that: the kinds it passed in are the ones the write just overruled. What was stored is asked with every name this write
+   calls a setting that it left unclassified read as one, so a classification never forgets a relationship the stored
+   session held. Rotating the value that protects one -- a new bearer, a re-imported cookie -- therefore cannot
+   unprotect it. A setting whose own value that write replaces is left alone: the text that was protected is no
+   longer under that name.
    What the scan finds is a copy of a value it is given, 6 characters or longer, as it is or unquoted or URL-decoded:
    in the text; in what the text decodes to, through up to three layers of percent-encoding, JSON escapes and base64
    runs of 16 characters or more decoded whole; and as the value's own base64 encoding at any byte offset, in the
@@ -240,7 +278,9 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    fails the final check. The save-time scan (`heal.ts`) and export still waive a public header whole, and no other public name.
    Learning runs first on every add and recapture, so a public header reaches them holding no cookie and no stored
    credential the scan can find; a public query or body field that holds a session value another operation of the site stored
-   learns, and `add` then refuses to save it.
+   learns, and `add` then refuses to save it where that value is one of the site's credentials. Where the other operation
+   recorded it as a setting, the save goes through: the field keeps it as captured, and this operation's own leaf that
+   equals it is a ref as ever.
 5. **Volatile anchors.** A hash-like literal (queryId path segment, doc_id, persisted hash) gets a
    `volatile` entry recording its shape (charset + length) and a stable **anchor** string next to it
    (the GraphQL operationName or the neighboring path segment). This is what the cheap heal uses.
@@ -527,7 +567,11 @@ send a request again (its own scripts, a retry after a navigation or a connectio
 - A browser locks a profile to one process. The browser is released after 3 s idle, and a second
   process waits up to 15 s for the profile before it fails with a short hint. SIGTERM exits.
 - After every browser run, cookies are exported (full Playwright cookie objects) to
-  `~/.api-anything/sessions/<site>.json`, together with session values seen in captured headers.
+  `~/.api-anything/sessions/<site>.json`, together with session values seen in captured headers and what a learn
+  classified each of them as, a setting or a credential. A later run that only refreshes the values classifies
+  nothing: a setting whose value changed is unclassified again, and a credential stays one. Every write of the file
+  goes through one place, which records there what the save-time scan keeps and returns that, so no write undoes
+  its protection and no caller goes on scanning with the classification the write overruled.
 - `softFrom` loads the neutral page, then navigates in-app: a link the app rendered is clicked
   (its router handles it); otherwise `history.pushState` + `popstate`, which client routers listen
   to. Only if nothing fired does it load the URL. An injected `<a>` is not routed by React Router,

@@ -15,8 +15,9 @@ after(() => rmSync(HOME, { recursive: true, force: true }));
 import { addOperation, type CaptureFile } from "../../src/heal.js";
 import { buildRequest } from "../../src/http.js";
 import { learnOperation, matches } from "../../src/learn.js";
-import { scanSecrets } from "../../src/secrets.js";
-import { exportSite } from "../../src/store.js";
+import { credentialsOf, scanSecrets } from "../../src/secrets.js";
+import { loadSession, mergeCapture, saveSession } from "../../src/session.js";
+import { exportSite, loadSite } from "../../src/store.js";
 import type { Exchange, StoredCookie } from "../../src/types.js";
 
 const A = "Zx81kLmN0pQrStUv2wXyZ3aBcD";
@@ -1131,4 +1132,382 @@ test("add checks a short example before any browser run, and learns one from two
     from2: capture("CA"),
   });
   assert.deepEqual(r.operation.slots, [{ param: "q", at: ["query:country"] }]);
+});
+
+/* ------------------------- a setting in a key, a cookie in a ref's name */
+
+// Issue #25: a page keeps the word "sessions" in a storage entry whose key is scoped by the org id a
+// cookie carries. The setting's ref keeps it fresh; neither the query key that spells the setting nor
+// the ref's own name may refuse the add.
+const ORG = "550e8400-e29b-41d4-a716-446655440000";
+const scoped = (leaf: string, org = ORG) =>
+  JSON.stringify({ state: { byScope: { sidebar: { [org]: { sections: [{ id: leaf }] } } } } });
+const sessionsUrl = "http://127.0.0.1/v1/code/sessions?q=kittens&include_trigger_sessions=true";
+
+test("a stored setting spelled in a query key saves, and a ref's name keeps no cookie its storage key holds", async () => {
+  const org = [here("lastActiveOrg", ORG)];
+  const { operation: op } = await add("issue25", xhr({ url: sessionsUrl }), org, { store: scoped("sessions") });
+  // the org id reached the ref's name through the storage key: hashed, so nothing live is in the spec
+  const ref = "session:op/store/state/byScope/sidebar/a3a9e1ed9732/sections/0/id";
+  assert.deepEqual(op.slots, [
+    { param: "q", at: ["query:q"] },
+    { ref, at: ["path:2"] },
+  ]);
+  assert.ok(!JSON.stringify(op).includes(ORG), "no part of the cookie is in the saved spec");
+  // the setting the request spells in a query key is no credential, here or on export
+  assert.equal(new URL(op.request.url).searchParams.get("include_trigger_sessions"), "true");
+  assert.deepEqual(exportSite("issue25").secrets, []);
+  // the ref still resolves, so a replay fills the path from the session
+  assert.deepEqual(loadSession("issue25").values, { [ref.slice(8)]: "sessions" });
+  // the leaf and the org id the cookie holds sit in one container: siblings, not copies of each other
+  assert.deepEqual(loadSession("issue25").kinds, { [ref.slice(8)]: "setting" });
+  assert.equal(
+    buildRequest(op, { q: "puppies" }, loadSession("issue25")).url,
+    sessionsUrl.replace("kittens", "puppies"),
+  );
+  // the hash is of the storage key alone, so a recapture of the same page finds the same ref
+  const again = await add("issue25-again", xhr({ url: sessionsUrl }), org, { store: scoped("sessions") });
+  assert.equal(again.operation.slots.at(-1)!.ref, ref);
+  // a different org id gives a different name: one ref never means two values
+  const other = await add("issue25-other", xhr({ url: sessionsUrl }), [here("lastActiveOrg", B)], {
+    store: scoped("sessions", B),
+  });
+  assert.notEqual(other.operation.slots.at(-1)!.ref, ref);
+});
+
+test("a real credential in the same shape is still refused, by its own text and by its storage key", async () => {
+  const T = "k7Qm9xLp3Rv8Tz1Wn5Ys6Ub4Hc2Jd0Fa";
+  const b64 = (s: string) => Buffer.from(s).toString("base64");
+  const before = readdirSync(HOME, { recursive: true }).sort();
+  // the stored leaf is a token, copied base64 where no pass can make it a ref
+  await assert.rejects(
+    add("issue25-token", xhr({ url: `${local}?q=kittens&ctx=${b64(T)}` }), [], { store: scoped(T) }),
+    /query:ctx holds the live session value storage:store\/state\/byScope\/sidebar\/.*\/sections\/0\/id\./,
+  );
+  // ...and the same under a credential's key inside the entry, which no ref name hashes
+  await assert.rejects(
+    add("issue25-named", xhr({ url: `${local}?q=kittens&ctx=${b64(T)}` }), [], {
+      store: JSON.stringify({ token: T }),
+    }),
+    /query:ctx holds the live session value storage:store\/token\./,
+  );
+  assert.deepEqual(readdirSync(HOME, { recursive: true }).sort(), before, "a refused add writes nothing");
+});
+
+test("the save-time scan skips a recorded setting, and looks for everything else", () => {
+  const T = "k7Qm9xLp3Rv8Tz1Wn5Ys6Ub4Hc2Jd0Fa";
+  const asSettings = (names: string[]) => Object.fromEntries(names.map((n) => [n, "setting" as const]));
+  const held = (values: Record<string, string>, settings?: string[]) =>
+    scanSecrets(
+      { url: `${local}?ctx=${Object.values(values).join("|")}` },
+      credentialsOf({ cookies: [], values, ...(settings ? { kinds: asSettings(settings) } : {}) }),
+    ).secrets;
+  // a session file from before the field, or with nothing recorded, is scanned whole
+  assert.deepEqual(held({ "op/theme": "solarized-dark" }), ["$.url holds the live session value op/theme"]);
+  assert.deepEqual(held({ "op/theme": "solarized-dark" }, []), ["$.url holds the live session value op/theme"]);
+  // recorded as a setting: skipped
+  assert.deepEqual(held({ "op/theme": "solarized-dark" }, ["op/theme"]), []);
+  // ...unless its own text reads like a credential, whatever the name was recorded as
+  assert.deepEqual(held({ "op/theme": T }, ["op/theme"]), ["$.url holds the live session value op/theme"]);
+  // ...or a name that is no setting holds the same text: that classification wins
+  assert.deepEqual(held({ "a/theme": "solarized-dark", "b/token": "solarized-dark" }, ["a/theme"]), [
+    "$.url holds the live session value a/theme",
+    "$.url holds the live session value b/token",
+  ]);
+  // a cookie is never a setting
+  assert.deepEqual(
+    scanSecrets(
+      { url: `${local}?ctx=solarized-dark` },
+      credentialsOf({ cookies: [cookie("theme", "solarized-dark")], values: {}, kinds: asSettings(["theme"]) }),
+    ).secrets,
+    ["$.url holds the live cookie theme"],
+  );
+});
+
+test("a session a refused add left with the setting unclassified still adds", async () => {
+  const ref = "op/store/state/byScope/sidebar/a3a9e1ed9732/sections/0/id";
+  // what the add that refused before the fix left behind: the value stored, with nothing classified
+  saveSession("issue25-stale", { cookies: [], values: { [ref]: "sessions" } });
+  const { operation: op } = await add("issue25-stale", xhr({ url: sessionsUrl }), [here("lastActiveOrg", ORG)], {
+    store: scoped("sessions"),
+  });
+  // this learn classifies the name it was already holding, so the query key spelling it is no credential
+  assert.deepEqual(loadSession("issue25-stale").kinds, { [ref]: "setting" });
+  assert.equal(new URL(op.request.url).searchParams.get("include_trigger_sessions"), "true");
+  assert.deepEqual(exportSite("issue25-stale").secrets, []);
+});
+
+// A later operation of the same site saves a copy of a value an earlier one recorded as a setting.
+// What makes the earlier name a setting is learning's classification; these two say what unmakes it.
+const addOp = (
+  site: string,
+  op: string,
+  ex: Exchange,
+  storage?: Record<string, string>,
+  cookies: StoredCookie[] = [],
+) =>
+  addOperation({
+    site,
+    op,
+    trigger: { url: "http://127.0.0.1/?q={q}" },
+    examples: [{ q: "kittens" }],
+    from: { capture: capture(ex, cookies, storage) },
+  });
+const b64 = (s: string) => Buffer.from(s).toString("base64");
+
+test("a stored JSON container is no setting, so a copy of one is refused with the credential inside it", async () => {
+  const T = "k7Qm9xLp3Rv8Tz1Wn5Ys6Ub4Hc";
+  // formatted as a page writes its own JSON: the container is no token itself, and holds one
+  const held = JSON.stringify({ token: T }, null, 1);
+  // op one sends it whole, so the ref for the token inside it is dropped and only the container is stored
+  await addOp("c25-whole", "one", xhr({ url: `${local}?q=kittens&state=${encodeURIComponent(held)}` }), {
+    cache: held,
+  });
+  assert.deepEqual(loadSession("c25-whole").values, { "one/cache": held });
+  // nothing here reads like a token (a JSON container is never random-looking), but no container is ever
+  // left out of the scan, so that is what the classification records
+  assert.deepEqual(loadSession("c25-whole").kinds, { "one/cache": "credential" });
+  // op two copies the container base64 inside a longer leaf, where no pass can make it a ref
+  await assert.rejects(
+    addOp("c25-whole", "two", xhr({ url: `${local}?q=kittens&ctx=${encodeURIComponent(`v1:${b64(held)}`)}` })),
+    /\$\.request\.url holds the live session value one\/cache/,
+  );
+  assert.deepEqual(exportSite("c25-whole").secrets, [], "op one itself keeps no copy");
+});
+
+test("a setting a credential holds is no setting either: a copy of the text is refused", async () => {
+  const token = "ordinary-value";
+  // one text, stored as a theme and sent as the bearer: too short and too plain to read as a token
+  await addOp(
+    "c25-bearer",
+    "one",
+    xhr({ url: `${local}?q=kittens&theme=${token}`, headers: { authorization: `Bearer ${token}` } }),
+    { theme: token },
+  );
+  const session = loadSession("c25-bearer");
+  // the learn read the theme as a setting; the bearer holds its text, so the write records a credential
+  assert.deepEqual(session.kinds, { "one/theme": "credential", "one/authorization": "credential" });
+  assert.equal(session.values["one/authorization"], `Bearer ${token}`);
+  // op two copies it base64 where no pass can make it a ref: the bearer protects the text
+  await assert.rejects(
+    addOp("c25-bearer", "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+    /\$\.request\.url holds the live session value one\/theme/,
+  );
+  assert.deepEqual(exportSite("c25-bearer").secrets, [], "op one itself keeps no copy");
+});
+
+test("a setting a protected value reaches only through another setting is no setting either", async () => {
+  const leaf = "ordinary/value";
+  // the page keeps a redirect URL that spells the leaf three percent layers down, and the credential
+  // holds that URL base64: four layers from the credential, one more than the scan reads at a time
+  const url = `https://example.test/?state=${encodeURIComponent(encodeURIComponent(encodeURIComponent(leaf)))}`;
+  const one = `${local}?q=kittens&theme=${leaf}&redirect=${encodeURIComponent(url)}`;
+  const two = (site: string) => addOp(site, "two", xhr({ url: `${local}?q=kittens&ctx=${b64(leaf)}` }));
+  // op one's learn reads both as settings: a URL is never random-looking, and neither is the leaf
+  await addOp("c25-chain", "one", xhr({ url: one, headers: { authorization: `Bearer ${b64(url)}` } }), {
+    theme: leaf,
+    redirect: url,
+  });
+  // both were read as settings, and the chain protects both: the write records what the scan keeps
+  assert.deepEqual(loadSession("c25-chain").kinds, {
+    "one/theme": "credential",
+    "one/redirect": "credential",
+    "one/authorization": "credential",
+  });
+  // the bearer protects the redirect, and the redirect then protects the theme
+  await assert.rejects(two("c25-chain"), /\$\.request\.url holds the live session value one\/theme/);
+  assert.deepEqual(exportSite("c25-chain").secrets, [], "op one itself keeps no copy");
+  // the same chain where a cookie, not a session value, is what holds the redirect
+  await addOp("c25-chain-cookie", "one", xhr({ url: one }), { theme: leaf, redirect: url }, [here("sid", b64(url))]);
+  await assert.rejects(two("c25-chain-cookie"), /\$\.request\.url holds the live session value one\/theme/);
+  assert.deepEqual(exportSite("c25-chain-cookie").secrets, [], "op one itself keeps no copy");
+});
+
+test("a re-learn reading a stored credential as a setting does not unprotect it", async () => {
+  const token = "ordinary-value";
+  // op one sends the text under a credential's field name, so the entry that holds it is a credential
+  await addOp("c25-sticky", "one", xhr({ url: `${local}?q=kittens&token=${token}` }), { cache: token });
+  assert.deepEqual(loadSession("c25-sticky").kinds, { "one/cache": "credential" });
+  // learned again after the site renamed the field: the same entry now reads as a setting, and stays protected
+  await addOp("c25-sticky", "one", xhr({ url: `${local}?q=kittens&ticket=${token}` }), { cache: token });
+  assert.deepEqual(loadSession("c25-sticky").kinds, { "one/cache": "credential" });
+  // op two copies it base64 where no pass can make it a ref
+  await assert.rejects(
+    addOp("c25-sticky", "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+    /\$\.request\.url holds the live session value one\/cache/,
+  );
+  assert.deepEqual(exportSite("c25-sticky").secrets, [], "op one itself keeps no copy");
+});
+
+test("a refresh that changes a setting's value unclassifies it, one that reads it back does not", async () => {
+  const token = "ordinary-value";
+  // op one stores the theme the page keeps, and the query spells it: a setting, as ever
+  await addOp("c25-refresh", "one", xhr({ url: `${local}?q=kittens&ticket=solarized-dark` }), {
+    cache: "solarized-dark",
+  });
+  assert.deepEqual(loadSession("c25-refresh").kinds, { "one/cache": "setting" });
+  // a trigger run or a recapture refreshes the stored values without classifying them, and the page can
+  // put anything at the slot's position: a changed value is unclassified again, so the scan protects it
+  mergeCapture("c25-refresh", [], { "one/cache": token });
+  assert.equal(loadSession("c25-refresh").values["one/cache"], token);
+  assert.equal(loadSession("c25-refresh").kinds?.["one/cache"], undefined);
+  // op two copies the refreshed text base64 where no pass can make it a ref
+  await assert.rejects(
+    addOp("c25-refresh", "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+    /\$\.request\.url holds the live session value one\/cache/,
+  );
+  assert.deepEqual(exportSite("c25-refresh").secrets, [], "op one itself keeps no copy");
+  // a refresh that reads the same value back keeps the classification, so the issue's own shape still saves
+  const { operation: op } = await add("c25-same", xhr({ url: sessionsUrl }), [here("lastActiveOrg", ORG)], {
+    store: scoped("sessions"),
+  });
+  const ref = op.slots.at(-1)!.ref!.slice(8);
+  mergeCapture("c25-same", [], { [ref]: "sessions" });
+  assert.deepEqual(loadSession("c25-same").kinds, { [ref]: "setting" });
+  await addOp("c25-same", "two", xhr({ url: `${local}?q=kittens&include_trigger_sessions=true` }));
+  assert.deepEqual(exportSite("c25-same").secrets, []);
+});
+
+// What protects a setting is a relationship between live values, and a session write can replace either
+// side of it. The scan's answer is recorded at every write, so a rotation cannot undo it.
+test("a rotation of what protects a setting does not unprotect it", async () => {
+  const token = "ordinary-value";
+  const newer = "different-value";
+  const rotations: [string, (site: string) => Promise<unknown>][] = [
+    // a learn that reads the name again, and a bare refresh (a trigger run, a recapture)
+    [
+      "c25-rot-learn",
+      (site) => addOp(site, "one", xhr({ url: `${local}?q=kittens`, headers: { authorization: `Bearer ${newer}` } })),
+    ],
+    ["c25-rot-refresh", async (site) => mergeCapture(site, [], { "one/authorization": `Bearer ${newer}` })],
+  ];
+  for (const [site, rotate] of rotations) {
+    const one = xhr({ url: `${local}?q=kittens&theme=${token}`, headers: { authorization: `Bearer ${token}` } });
+    await addOp(site, "one", one, { theme: token });
+    assert.equal(loadSession(site).kinds?.["one/theme"], "credential", "the bearer held the theme's text");
+    await rotate(site);
+    const after = loadSession(site);
+    assert.equal(after.values["one/theme"], token, "the theme still holds the text the old bearer held");
+    assert.equal(after.values["one/authorization"], `Bearer ${newer}`);
+    assert.equal(after.kinds?.["one/theme"], "credential", "and keeps the protection the first write recorded");
+    // op two copies the text base64 where no pass can make it a ref
+    await assert.rejects(
+      addOp(site, "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+      /\$\.request\.url holds the live session value one\/theme/,
+    );
+    assert.deepEqual(exportSite(site).secrets, [], "op one itself keeps no copy");
+  }
+});
+
+test("a cookie re-import does not unprotect a setting the cookie it replaces held", async () => {
+  const token = "ordinary-value";
+  const sid = (t: string) => here("sid", `v1-${t}-x`);
+  const one = xhr({ url: `${local}?q=kittens&theme=${token}` });
+  await addOp("c25-rot-cookie", "one", one, { theme: token }, [sid(token)]);
+  assert.equal(loadSession("c25-rot-cookie").kinds?.["one/theme"], "credential", "the cookie held the theme's text");
+  // what a login or a self-heal re-import writes: the stored values, a fresh jar
+  const s = loadSession("c25-rot-cookie");
+  saveSession("c25-rot-cookie", { ...s, cookies: [sid("different-value")], source: "chrome:Default" });
+  assert.equal(loadSession("c25-rot-cookie").kinds?.["one/theme"], "credential");
+  await assert.rejects(
+    addOp("c25-rot-cookie", "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+    /\$\.request\.url holds the live session value one\/theme/,
+  );
+  assert.deepEqual(exportSite("c25-rot-cookie").secrets, [], "op one itself keeps no copy");
+});
+
+// A learn sees credentials it does not store: a cookie the request sent, a storage entry no leaf
+// repeated. Nothing records that relationship later, so the classification has to carry it.
+test("a setting a credential the learn never stored holds is no setting either", async () => {
+  const token = "ordinary-value";
+  const bearer = b64(token);
+  // the credential in storage under a name no leaf repeats, and the same one sent as a cookie
+  const live: [string, Record<string, string>, Record<string, string>][] = [
+    ["c25-live-stored", { theme: token, token: bearer }, {}],
+    ["c25-live-sent", { theme: token }, { cookie: `sid=${bearer}` }],
+  ];
+  for (const [site, storage, headers] of live) {
+    await addOp(site, "one", xhr({ url: `${local}?q=kittens&theme=${token}`, headers }), storage);
+    const session = loadSession(site);
+    // only the theme is stored, and the learn read the text the credential holds as a credential
+    assert.deepEqual(session.values, { "one/theme": token });
+    assert.deepEqual(session.cookies, []);
+    assert.deepEqual(session.kinds, { "one/theme": "credential" });
+    // op two copies the text base64 where no pass can make it a ref
+    await assert.rejects(
+      addOp(site, "two", xhr({ url: `${local}?q=kittens&ctx=${bearer}` })),
+      /\$\.request\.url holds the live session value one\/theme/,
+    );
+    assert.deepEqual(exportSite(site).secrets, [], "op one itself keeps no copy");
+  }
+});
+
+test("a rotation does not unprotect a setting a session file written before `kinds` left unclassified", async () => {
+  const token = "ordinary-value";
+  // what a release before the field wrote: the theme stored, the cookie that holds its text, nothing classified
+  saveSession("c25-legacy", { cookies: [here("sid", b64(token))], values: { "one/theme": token } });
+  assert.equal(loadSession("c25-legacy").kinds, undefined);
+  // the same op learned again, after the cookie rotated: this learn sees no credential holding the theme
+  await addOp("c25-legacy", "one", xhr({ url: `${local}?q=kittens&theme=${token}` }), { theme: token }, [
+    here("sid", "different-value"),
+  ]);
+  const after = loadSession("c25-legacy");
+  assert.equal(after.values["one/theme"], token);
+  // the stored file held the relationship, so classifying the name asks what it protected there too
+  assert.deepEqual(after.kinds, { "one/theme": "credential" });
+  await assert.rejects(
+    addOp("c25-legacy", "two", xhr({ url: `${local}?q=kittens&ctx=${b64(token)}` })),
+    /\$\.request\.url holds the live session value one\/theme/,
+  );
+  assert.deepEqual(exportSite("c25-legacy").secrets, [], "op one itself keeps no copy");
+});
+
+// The seal a session write adds (`recordProtection`) can overrule the classification of the learn
+// that asked for the write. That same add goes on to scan the op it is saving, so it has to scan
+// with what the write kept.
+test("the add whose classification the session write overruled scans its op with the write's", async () => {
+  const token = "ordinary-value";
+  // what a release before the field wrote: the theme stored, the cookie that holds its text, nothing classified
+  saveSession("c25-sealed", { cookies: [here("sid", b64(token))], values: { "one/theme": token } });
+  // the same op learned again after the cookie rotated, in a request that also copies the text base64
+  // where no pass can make it a ref. This learn sees no credential holding the theme, so it alone
+  // reads the name as a setting; the stored file holds the relationship, and the write records it.
+  await assert.rejects(
+    addOp("c25-sealed", "one", xhr({ url: `${local}?q=kittens&theme=${token}&ctx=${b64(token)}` }), { theme: token }, [
+      here("sid", "different-value"),
+    ]),
+    /\$\.request\.url holds the live session value one\/theme/,
+  );
+  assert.deepEqual(loadSession("c25-sealed").kinds, { "one/theme": "credential" });
+  assert.equal(loadSite("c25-sealed"), undefined, "a refused add saves no op");
+});
+
+// A link in the chain can be a value the learn only saw live: the page keeps it, no leaf repeats it,
+// so nothing stores it and no later write can record what it protects.
+test("a setting a credential reaches only through a live value the learn did not store is no setting", async () => {
+  const observed = "opaque/session-value";
+  const pct = (v: string) => encodeURIComponent(encodeURIComponent(encodeURIComponent(v)));
+  // the page keeps a URL spelling the cookie three percent layers down, and another spelling that one
+  // three layers further: six from the cookie, twice what the scan reads at a time
+  const inner = `https://example.test/?auth=${pct(observed)}`;
+  const outer = `https://example.test/?redirect=${pct(inner)}`;
+  // the leaf repeats the outer URL, so only that is stored; the cookie came with the request, and the
+  // inner URL sits in storage under a name no leaf repeats
+  await addOp(
+    "c25-link",
+    "one",
+    xhr({ url: `${local}?q=kittens&redirect=${encodeURIComponent(outer)}`, headers: { cookie: `sid=${observed}` } }),
+    { theme: outer, redirect: inner },
+  );
+  const session = loadSession("c25-link");
+  assert.deepEqual(session.values, { "one/theme": outer }, "the inner URL is not persisted");
+  assert.deepEqual(session.cookies, [], "a cookie the request sent is not persisted either");
+  // the inner URL is the only way from the cookie to the stored one, and the learn saw it: a credential
+  assert.deepEqual(session.kinds, { "one/theme": "credential" });
+  // op two copies the stored URL where no pass can make it a ref
+  await assert.rejects(
+    addOp("c25-link", "two", xhr({ url: `${local}?q=kittens&ctx=${encodeURIComponent(outer)}` })),
+    /\$\.request\.url holds the live session value one\/theme/,
+  );
+  assert.deepEqual(exportSite("c25-link").secrets, [], "op one itself keeps no copy");
 });

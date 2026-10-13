@@ -2,6 +2,7 @@
  * Captured exchanges + example args -> an Operation (DESIGN.md "Learning", steps 1-8).
  * Only example-arg values become params; everything else is kept verbatim.
  */
+import { createHash } from "node:crypto";
 import {
   asText,
   type Escape,
@@ -19,9 +20,11 @@ import {
 import { inferShape, innerJson, parseBody, xssiOf } from "./extract.js";
 import {
   credentialName,
+  credentialsOf,
   headerName,
   highEntropy,
   isCredential,
+  jsonContainer,
   lastToken,
   leafName,
   opaqueToken,
@@ -125,6 +128,8 @@ export interface Learned {
   warnings: string[];
   /** literal values of session: refs, for the session store; never written to the spec */
   sessionValues: Record<string, string>;
+  /** the names in `sessionValues` that are settings, not credentials; a save-time scan skips them */
+  settings: string[];
 }
 
 /* ------------------------------------------------------------------ noise */
@@ -942,9 +947,8 @@ function liveValues(cookies: StoredCookie[], storage: Record<string, string> = {
   }
   // Apps keep settings and saved requests in storage too. A stored value is a credential under a
   // credential's name or when it is random-looking; a JSON text is judged by its key and its leaves.
-  const json = (v: string) => /^\s*[[{]/.test(v);
   const secret = (v: string, ...names: string[]) =>
-    names.some((n) => isCredential(n, v)) || (!json(v) && highEntropy(v));
+    names.some((n) => isCredential(n, v)) || (!jsonContainer(v) && highEntropy(v));
   for (const [name, value] of Object.entries(storage)) {
     put(value, { ref: `session:${name}`, value, secret: secret(value, name) });
     const visit = (v: unknown, k: string): void => {
@@ -952,9 +956,39 @@ function liveValues(cookies: StoredCookie[], storage: Record<string, string> = {
         put(v, { ref: `session:${name}/${k}`, value: v, secret: secret(v, name, k.slice(k.lastIndexOf("/") + 1)) });
       else if (v && typeof v === "object") for (const [kk, c] of Object.entries(v)) visit(c, k ? `${k}/${kk}` : kk);
     };
-    if (json(value)) visit(tryParse(value), "");
+    if (jsonContainer(value)) visit(tryParse(value), "");
   }
+  // A storage key, and the JSON keys under it, may hold a live value themselves (a key scoped by the
+  // org id a cookie carries), and a ref's name reaches the spec. Checked once every value is known.
+  const seen = liveSeen(cookies, [...out.keys()]);
+  for (const l of out.values()) if (l.value !== undefined) l.ref = `session:${safeRefName(l.ref.slice(8), seen)}`;
   return out;
+}
+
+/** A session of live texts, for scanning a ref's name: only the hits matter, not their labels. */
+const liveSeen = (cookies: StoredCookie[], texts: string[]): Session => ({
+  cookies,
+  values: Object.fromEntries(texts.map((t, i) => [String(i), t])),
+});
+
+/**
+ * A ref's name reaches the spec, so it may hold no live value. Each `/`-separated part that does
+ * becomes a hash of that part, which keeps an exact copy out of the spec and does no more: a
+ * low-entropy id is recovered by hashing a guess. The hash is of the part alone, so the same
+ * storage key gives the same ref while the values it is checked against are unchanged; across a
+ * rotation a stored spec keeps the names it has, since a refresh reads each value at its slot's
+ * position (`sessionValuesOf`). Names that hold no live value stay as the page wrote them.
+ */
+function safeRefName(name: string, seen: Session): string {
+  const hit = (s: string) => scanSecrets(s, seen).secrets.length > 0;
+  if (!hit(name)) return name;
+  const digest = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 12);
+  const safe = name
+    .split("/")
+    .map((part) => (hit(part) ? digest(part) : part))
+    .join("/");
+  // a value spread over two parts survives that: then the whole name goes
+  return hit(safe) ? digest(name) : safe;
 }
 
 /* ------------------------------------------------------ session references */
@@ -972,6 +1006,8 @@ interface Refs {
   live: Map<string, Live>;
   /** literal values of session: refs by name, for the session store */
   sessionValues: Record<string, string>;
+  /** the cookies the learn saw, for checking that a ref's name holds none */
+  cookies: StoredCookie[];
 }
 
 /**
@@ -981,8 +1017,10 @@ interface Refs {
 function sessionRef(refs: Refs, ref: string, value: string, at: Step[]): string {
   const base = ref.slice(8);
   let name = base;
-  for (let n = 1; refs.sessionValues[name] !== undefined && refs.sessionValues[name] !== value; n++)
-    name = `${base}@${encodeURIComponent(key(at))}${n > 1 ? `.${n}` : ""}`;
+  for (let n = 1; refs.sessionValues[name] !== undefined && refs.sessionValues[name] !== value; n++) {
+    const where = safeRefName(encodeURIComponent(key(at)), liveSeen(refs.cookies, [...refs.live.keys()]));
+    name = `${base}@${where}${n > 1 ? `.${n}` : ""}`;
+  }
   refs.sessionValues[name] = value;
   // Newly discovered credentials need the same compound-copy cleanup as cookies/storage.
   const known = refs.live.get(value);
@@ -1258,7 +1296,13 @@ function sessionRefs(
   captured: Request,
   leaves: Leaf[],
   params: Slot[],
-): { request: Request; slots: Slot[]; sessionValues: Record<string, string>; publicNames: string[] } {
+): {
+  request: Request;
+  slots: Slot[];
+  sessionValues: Record<string, string>;
+  publicNames: string[];
+  settings: string[];
+} {
   const cookies = [...input.cookies, ...sentCookies(ex)];
   const live = liveValues(cookies, input.storage);
   // The final check refuses only a copy no pass could make a ref, so there the choice is to refuse or
@@ -1282,6 +1326,7 @@ function sessionRefs(
     taken: new Set(params.map((s) => key(s.at))),
     live,
     sessionValues: {},
+    cookies,
   };
   // A name the caller marked public keeps what it kept before these passes were reworked, no more:
   // a header by its name, a credential-like name over a random-looking value, a value an earlier
@@ -1318,7 +1363,38 @@ function sessionRefs(
   for (const s of refs.slots) if (s.ref) request = setAt(request, s.at, "");
   refuseLeftover(request, refs.slots, { cookies, values, stored });
   const listed = [...new Set([...publicNames, ...shipped])];
-  return { request, slots: refs.slots, sessionValues: refs.sessionValues, publicNames: listed };
+  // What the passes recorded as a setting, for the session store: a save-time scan skips those names.
+  // The learn sees credentials it never stores -- a cookie the request sent, a token in storage no leaf
+  // repeated -- and by save time those texts are gone, so the test the scan runs is asked here instead,
+  // against all of them: a candidate one of them holds, or that holds one, is recorded as a credential.
+  const candidates = Object.keys(refs.sessionValues).filter(
+    (n) => refs.live.get(refs.sessionValues[n]!)?.secret === false,
+  );
+  // A live setting no leaf stored is a link in the chain: the scan reads a few decoding layers, so a
+  // credential can reach a candidate through one without either end holding the other. Entered as a
+  // setting too, a link carries the relationship on. A JSON container is no link: a credential and a
+  // leaf beside it in one container are siblings, not copies (the very shape issue #25 is about).
+  const candidateValues = new Set(candidates.map((n) => refs.sessionValues[n]!));
+  const links = [...refs.live].flatMap(([v, l]) =>
+    l.secret === false && !jsonContainer(v) && !candidateValues.has(v) ? [v] : [],
+  );
+  // disjoint labels: a `c` is a credential the learn saw, an `s` a candidate the scan may leave out,
+  // an `l` a link it saw live and did not store
+  const seen: Session = {
+    cookies,
+    values: {
+      ...Object.fromEntries([...refs.live].flatMap(([v, l], i) => (l.secret === false ? [] : [[`c${i}`, v]]))),
+      ...Object.fromEntries(links.map((v, i) => [`l${i}`, v])),
+      ...Object.fromEntries(candidates.map((n, i) => [`s${i}`, refs.sessionValues[n]!])),
+    },
+    kinds: Object.fromEntries(
+      [...links.map((_, i) => `l${i}`), ...candidates.map((_, i) => `s${i}`)].map((n) => [n, "setting" as const]),
+    ),
+  };
+  // Only the candidates are stored, so only they are read back out; a link is a step on the way.
+  const kept = credentialsOf(seen).values;
+  const settings = candidates.filter((_, i) => !(`s${i}` in kept));
+  return { request, slots: refs.slots, sessionValues: refs.sessionValues, publicNames: listed, settings };
 }
 
 /**
@@ -1368,6 +1444,8 @@ function refuseLeftover(request: Request, slots: Slot[], known: Known): void {
   const templates = Object.fromEntries(
     slots.flatMap((s) => (s.template !== undefined ? [[s.at.join(" > "), s.template]] : [])),
   );
+  // Ref names reach the spec too: one built from a storage key may hold a live value.
+  const refNames = slots.map((s) => (s.ref !== undefined ? { ref: s.ref } : {}));
   // What the scan finds in the slot templates and in the stored request, the exempt leaves blank.
   const look = (live: Session, exempt: (at: Step[]) => boolean = () => false): string[] => {
     let rest = request;
@@ -1377,7 +1455,7 @@ function refuseLeftover(request: Request, slots: Slot[], known: Known): void {
       rest = setAt(rest, at, "");
       gone.push(at);
     }
-    const whole = scanSecrets({ request: rest, templates }, live).secrets;
+    const whole = scanSecrets({ request: rest, templates, slots: refNames }, live).secrets;
     return whole.length ? placed(rest, live, whole) : [];
   };
   const secrets = [
@@ -1712,7 +1790,13 @@ function learn(input: LearnInput, disproved: Disproved): Learned {
   );
 
   // 4. session refs: live cookie/storage values anywhere, per-session fields, credential-named values, auth headers
-  const { request, slots, sessionValues, publicNames } = sessionRefs(input, exchange, captured, leaves, param.slots);
+  const { request, slots, sessionValues, publicNames, settings } = sessionRefs(
+    input,
+    exchange,
+    captured,
+    leaves,
+    param.slots,
+  );
 
   // 5. volatile anchors
   const volatile = volatileAnchors(request, leaves, slots);
@@ -1764,5 +1848,6 @@ function learn(input: LearnInput, disproved: Disproved): Learned {
     sessionValues: Object.fromEntries(
       Object.entries(sessionValues).map(([k, v]) => [`${encodeURIComponent(input.name)}/${k}`, v]),
     ),
+    settings: settings.map((n) => `${encodeURIComponent(input.name)}/${n}`),
   };
 }

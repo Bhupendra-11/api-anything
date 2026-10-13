@@ -867,6 +867,32 @@ describe("heal without a browser (maxTier 1)", () => {
     };
     assert.equal(await rescan("far", op, { name: "bob" }, fake(h)), undefined);
   });
+
+  // Issue #25: the healed spec is scanned against the site's session, which holds settings a ref keeps
+  // fresh as well as credentials. A setting the template spells must not block the heal.
+  test("a healed spec is scanned for the session's credentials, not for a setting a ref keeps fresh", async () => {
+    const themed = (name: string) =>
+      userSite(name, {
+        request: { method: "GET", url: `https://t.test/api/${OLD}/User?name=alice&theme=solarized-dark`, headers: {} },
+      });
+    saveSite(themed("healset"));
+    saveSession("healset", {
+      cookies: [],
+      values: { "user/theme": "solarized-dark" },
+      kinds: { "user/theme": "setting" },
+    });
+    const r = await call("healset", "user", { name: "bob" }, tier1(rotatingHandler(() => NEW)));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.healed, true);
+    assert.ok(loadSite("healset")!.site.operations[0]!.request.url.includes(NEW));
+    // the same value recorded as no setting is a credential the heal refuses to save
+    saveSite(themed("healcred"));
+    saveSession("healcred", { cookies: [], values: { "user/theme": "solarized-dark" } });
+    const refused = await call("healcred", "user", { name: "bob" }, tier1(rotatingHandler(() => NEW)));
+    assert.equal(refused.ok, false, JSON.stringify(refused));
+    assert.match(refused.reason ?? "", /refusing to save a healed spec containing a credential/);
+    assert.ok(loadSite("healcred")!.site.operations[0]!.request.url.includes(OLD), "nothing was saved");
+  });
 });
 
 /* ------------------------------------------------------------------ browser */
