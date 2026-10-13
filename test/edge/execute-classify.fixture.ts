@@ -1,7 +1,7 @@
 /** Edge-case site for the execute/classify probes: redirects, cookies, encodings, slow and broken responses. */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { brotliCompressSync, deflateSync, gzipSync, zstdCompressSync } from "node:zlib";
+import * as zlib from "node:zlib";
 
 export interface Hit {
   method: string;
@@ -146,14 +146,15 @@ export async function startFixture(): Promise<Fixture> {
       case "/enc": {
         const raw = Buffer.from(JSON.stringify({ items: [{ name: "café ☕" }] }));
         const e = u.searchParams.get("e")!;
+        if (e === "zstd" && !zlib.zstdCompressSync) return void res.writeHead(501).end("zstd is unavailable");
         const buf =
           e === "gzip"
-            ? gzipSync(raw)
+            ? zlib.gzipSync(raw)
             : e === "br"
-              ? brotliCompressSync(raw)
+              ? zlib.brotliCompressSync(raw)
               : e === "deflate"
-                ? deflateSync(raw)
-                : zstdCompressSync(raw);
+                ? zlib.deflateSync(raw)
+                : zlib.zstdCompressSync(raw);
         return void res.writeHead(200, { "content-type": "application/json", "content-encoding": e }).end(buf);
       }
       case "/latin1":

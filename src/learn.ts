@@ -761,7 +761,11 @@ function paramSlots(
       const want = JSON.stringify(raw);
       const at = leaves
         .filter((l) => l.container)
-        .flatMap((l) => jsonPointers(JSON.parse(l.value), want).map((p) => [...l.at, `json:${p}`]));
+        .flatMap((l) => {
+          const encoded = !/^\s*[[{]/.test(l.value);
+          const text = encoded ? Buffer.from(l.value, "base64").toString("utf8") : l.value;
+          return jsonPointers(JSON.parse(text), want).map((p) => [...l.at, ...(encoded ? ["b64"] : []), `json:${p}`]);
+        });
       if (!at.length) throw notFound(name, raw);
       for (const a of at) slots.push({ param: name, at: a });
       types.set(name, Array.isArray(raw) ? "array" : "object");
@@ -1301,6 +1305,14 @@ function sessionRefs(
     Object.entries(refs.sessionValues).filter(([, v]) => refs.live.get(v)?.secret !== false && !nameOnly.has(v)),
   );
   sentWhole(refs, held);
+  for (const param of params) {
+    const ref = refs.slots.find((s) => s.ref && covers(param.at, s.at));
+    if (ref)
+      throw new Error(
+        `param ${param.param} at ${param.at.join(" > ")} contains a session value (${ref.ref}) at ` +
+          `${ref.at.join(" > ")}; replacing the param would overwrite the reference. Not learned: ${ANOTHER_REQUEST}`,
+      );
+  }
   refuseRepeatedKeys(leaves, refs.slots);
   // A ref'd leaf's value lives in the session, not the spec: blank it.
   for (const s of refs.slots) if (s.ref) request = setAt(request, s.at, "");
@@ -1448,8 +1460,8 @@ export function suggestExtract(root: unknown, values: string[]): string | undefi
   let anyArray: { path: string; len: number } | undefined;
   let holder: { path: string; depth: number } | undefined;
   const queue: { v: unknown; path: string; depth: number }[] = [{ v: root, path: "", depth: 0 }];
-  while (queue.length) {
-    const { v, path, depth } = queue.shift()!;
+  for (let i = 0; i < queue.length; i++) {
+    const { v, path, depth } = queue[i]!;
     if (depth > 8 || !v || typeof v !== "object") continue;
     const children: [string, unknown][] = Array.isArray(v)
       ? v.slice(0, 50).map((c, i) => [`${path}[${i}]`, c])

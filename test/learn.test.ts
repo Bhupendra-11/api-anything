@@ -99,6 +99,94 @@ function xExchanges(handle: string, txn: string, id0 = 1): Exchange[] {
 
 const trigger = { url: "https://x.com/{screen_name}" };
 
+test("structured params cannot cover session refs, but sibling refs still replay", () => {
+  const token = "aB3dEf9hK2Lm8Np5";
+  for (const encoded of [false, true]) {
+    const learn = (filter: Record<string, unknown>, sibling = false) => {
+      const json = JSON.stringify({ filter, ...(sibling ? { token } : {}) });
+      const state = encoded ? Buffer.from(json).toString("base64url") : json;
+      return learnOperation({
+        name: "filter",
+        readOnly: true,
+        trigger: { url: "https://fixture.test/search" },
+        match: { path: "/api/search" },
+        examples: [{ filter }],
+        cookies: [cookie("sid", token, ".fixture.test")],
+        exchanges: [
+          {
+            id: 1,
+            resourceType: "fetch",
+            request: {
+              method: "GET",
+              url: `https://fixture.test/api/search?state=${encodeURIComponent(state)}`,
+              headers: {},
+            },
+            response: {
+              status: 200,
+              headers: {},
+              contentType: "application/json",
+              body: '{"results":[{"name":"nasa"}]}',
+            },
+          },
+        ],
+      });
+    };
+    assert.throws(() => learn({ name: "nasa", token }), /param filter .* contains a session value.*Not learned/);
+    const { operation } = learn({ name: "nasa" }, true);
+    assert.ok(!JSON.stringify(operation).includes(token));
+    const filled = buildRequest(
+      operation,
+      { filter: { name: "esa" } },
+      { cookies: [cookie("sid", token, ".fixture.test")], values: {} },
+    );
+    const root = ["query:state", ...(encoded ? ["b64"] : [])];
+    assert.deepEqual(getAt(filled, [...root, "json:/filter"]), { name: "esa" });
+    assert.equal(getAt(filled, [...root, "json:/token"]), token);
+  }
+});
+
+test("structured examples inside base64 JSON keep the encoding and unrelated bytes when filled", () => {
+  for (const example of [{ name: "nasa", count: 5 }, ["nasa", "spacex"]]) {
+    for (const encoding of ["base64", "base64url"] as const) {
+      const data = Buffer.from(JSON.stringify({ filter: example, constant: "unchanged" })).toString(encoding);
+      const { operation } = learnOperation({
+        name: "filter",
+        readOnly: true,
+        trigger: { url: "https://fixture.test/search" },
+        match: { path: "/api/search" },
+        examples: [{ filter: example }],
+        cookies: [],
+        exchanges: [
+          {
+            id: 1,
+            resourceType: "fetch",
+            request: {
+              method: "GET",
+              url: `https://fixture.test/api/search?data=${encodeURIComponent(data)}&constant=%2f%2F`,
+              headers: {},
+            },
+            response: {
+              status: 200,
+              headers: {},
+              contentType: "application/json",
+              body: '{"results":[{"name":"nasa"}]}',
+            },
+          },
+        ],
+      });
+      assert.deepEqual(
+        operation.slots.filter((s) => s.param),
+        [{ param: "filter", at: ["query:data", "b64", "json:/filter"] }],
+      );
+      const replacement = Array.isArray(example) ? ["jpl", "esa"] : { name: "jpl", count: 8 };
+      const request = buildRequest(operation, { filter: replacement }, { cookies: [], values: {} });
+      assert.deepEqual(getAt(request, ["query:data", "b64", "json:/filter"]), replacement);
+      assert.equal(getAt(request, ["query:data", "b64", "json:/constant"]), "unchanged");
+      assert.ok(request.url.endsWith("&constant=%2f%2F"));
+    }
+  }
+});
+
 test("X-like GraphQL GET: params, cookie/session refs, volatile anchor, match, headers, response", () => {
   const {
     operation: op,

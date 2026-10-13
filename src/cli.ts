@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** api-anything CLI. Compact JSON on stdout; every failure also prints one `next:` line on stderr. */
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { browserAvailable, closeBrowser, login, ProfileInUse } from "./browser.js";
@@ -22,12 +22,14 @@ import { buildRequest } from "./http.js";
 import { AmbiguousProfile } from "./import.js";
 import { type Candidate, capturePages, pageUrls, rankCandidates } from "./learn.js";
 import { cookieNames, importSession, logout, resolveLoginTarget } from "./login.js";
-import { serveStdio, VERSION } from "./mcp.js";
 import { type Outline, outline } from "./outline.js";
 import { loadSession, loggedIn, saveSession, sessionFile, withLock } from "./session.js";
 import { HtmlRecipeSchema, MatchSchema, type Operation, TriggerStepSchema } from "./spec.js";
 import { exportSite, listSites, loadSite, siteNotes } from "./store.js";
 import type { Exchange, TriggerStep } from "./types.js";
+
+const VERSION = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string })
+  .version;
 
 /** capture/inspect --outline: the scout's summary of one exchange's response. */
 function outlineOf(e: Exchange | undefined, values: string[]): { outline?: Outline } {
@@ -776,6 +778,7 @@ function cmdExport({ v, pos }: Parsed): number {
 }
 
 async function cmdMcp({ v }: Parsed): Promise<number> {
+  const { serveStdio } = await import("./mcp.js");
   await serveStdio({ allowWrites: v["allow-writes"] });
   return -1; // keep serving
 }

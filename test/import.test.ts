@@ -3,7 +3,7 @@
  * browser, no Keychain: API_ANYTHING_BROWSER_ROOTS injects roots and the Safe Storage password.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -158,6 +158,40 @@ test("--profile pin overrides selection; a missing pin throws", () => {
   assert.throws(
     () => importFromBrowsers({ url: "https://linkedin.com", pin: { browser: "chrome", profile: "Nope" } }),
     /no browser profile/,
+  );
+});
+
+test("a pinned import never opens another profile or browser's cookie database", () => {
+  const root = tmp();
+  makeChromiumDb(join(root, "Default"), [li], { password: "pw" });
+  mkdirSync(join(root, "Profile 2", "Network"), { recursive: true });
+  writeFileSync(join(root, "Profile 2", "Network", "Cookies"), "not a database");
+  const other = tmp();
+  mkdirSync(join(other, "Default", "Network"), { recursive: true });
+  writeFileSync(join(other, "Default", "Network", "Cookies"), "not a database");
+  inject([
+    { name: "Chrome", family: "chromium", root, password: "pw" },
+    { name: "Brave", family: "chromium", root: other, password: "pw" },
+  ]);
+  const r = importFromBrowsers({ url: "https://linkedin.com", pin: { browser: "chrome", profile: "Default" } });
+  assert.equal(r?.source, "chrome:Default");
+  assert.equal(r?.cookies[0]?.value, li.value);
+});
+
+test("a profile pin without a browser still refuses matching accounts in different browsers", () => {
+  const roots = [tmp(), tmp()];
+  for (const root of roots) makeFirefoxDb(join(root, "shared"), [li]);
+  inject([
+    { name: "Firefox", family: "firefox", root: roots[0]! },
+    { name: "Other Firefox", family: "firefox", root: roots[1]! },
+  ]);
+  assert.throws(
+    () => importFromBrowsers({ url: "https://linkedin.com", pin: { profile: "shared" } }),
+    AmbiguousProfile,
+  );
+  assert.equal(
+    importFromBrowsers({ url: "https://linkedin.com", pin: { browser: "firefox", profile: "shared" } })?.source,
+    "firefox:shared",
   );
 });
 

@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import * as zlib from "node:zlib";
 import { addCookiesToProfile, browserAvailable, closeBrowser, openBrowser } from "../../src/browser.js";
 import { classify, judge, type Observed } from "../../src/classify.js";
 import { call } from "../../src/execute.js";
@@ -273,12 +274,20 @@ describe("tier 1 cookies and redirects", () => {
 /* ----------------------------------------------------------------- bodies */
 
 describe("response bodies", () => {
-  test("gzip, br, deflate and zstd bodies are decoded", async () => {
-    site("enc", ...["gzip", "br", "deflate", "zstd"].map((e) => rd(e, `/enc?e=${e}`)));
-    for (const e of ["gzip", "br", "deflate", "zstd"]) {
+  test("gzip, br and deflate bodies are decoded", async () => {
+    site("enc", ...["gzip", "br", "deflate"].map((e) => rd(e, `/enc?e=${e}`)));
+    for (const e of ["gzip", "br", "deflate"]) {
       const r = await call("enc", e, {}, t1);
       assert.deepEqual(r.data, [{ name: "café ☕" }], `${e}: ${JSON.stringify(r)}`);
     }
+  });
+
+  test("zstd bodies are decoded", {
+    skip: !zlib.zstdCompressSync && "Node 22.15 or newer is required for zstd",
+  }, async () => {
+    site("enc", rd("zstd", "/enc?e=zstd"));
+    const r = await call("enc", "zstd", {}, t1);
+    assert.deepEqual(r.data, [{ name: "café ☕" }], JSON.stringify(r));
   });
 
   test("a UTF-8 BOM before JSON parses", async () => {

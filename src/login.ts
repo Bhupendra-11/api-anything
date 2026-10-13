@@ -128,7 +128,14 @@ export async function logout(site: string): Promise<void> {
   withLock(sessionFile(site), () => saveSession(site, { cookies: [], values: {} }));
   if (browserAvailable()) {
     try {
-      await clearProfileCookies(site, profileDir());
+      let domain = site.toLowerCase();
+      try {
+        const baseUrl = loadSite(site)?.site.baseUrl;
+        if (baseUrl) domain = siteOf(new URL(baseUrl).hostname);
+      } catch {
+        // A corrupt spec must not prevent logging out a domain-named site.
+      }
+      await clearProfileCookies(domain, profileDir());
     } catch {
       /* no profile yet, or the browser open */
     }

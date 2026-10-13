@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parse } from "node-html-parser";
 import { extractEmbedded, extractHtml } from "../src/extract.js";
-import { outline, sig } from "../src/outline.js";
+import { outline, outlineJson, sig } from "../src/outline.js";
 
 const row = (id: string, title: string, rating: string, badge = "") =>
   `<li><div class="Book" data-testid="book-item-kca://book/${id}"><a class="BookCard__link" href="/book/show/${id}">cover</a>` +
@@ -15,6 +15,15 @@ const page =
   row("1003", "Children of Dune", "3.96") +
   row("1004", "Dune: House Atreides", "3.8") +
   `</ul></body></html>`;
+
+test("scout's breadth-first search keeps the first five matching paths on wide responses", () => {
+  const rows = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`row${i}`, { name: `target ${i}` }]));
+  const found = outlineJson({ rows }, ["target"]);
+  assert.deepEqual(
+    found.at,
+    Array.from({ length: 5 }, (_, i) => `rows.row${i}.name`),
+  );
+});
 
 test("scout: a repeated HTML list carrying the example becomes a working --html recipe", () => {
   const o = outline("text/html", page, ["dune"]);
