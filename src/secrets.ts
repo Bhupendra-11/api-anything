@@ -35,6 +35,9 @@ export function credentialName(name: string): boolean {
 
 export const URLISH = /^[a-z][a-z0-9+.-]*:\/\//i;
 
+/** JSON text: an object or an array, whose leaves are judged one by one and whose siblings are not copies. */
+export const jsonContainer = (v: string) => /^\s*[[{]/.test(v);
+
 /** Random-looking: 16+ chars, no spaces, not a URL, two character classes, 3+ bits of entropy per char. */
 export function highEntropy(v: string): boolean {
   if (v.length < 16 || /\s/.test(v) || URLISH.test(v)) return false;
@@ -229,4 +232,56 @@ export function scanSecrets(
   };
   visit(value, "$");
   return { secrets: [...new Set(secrets)], warnings: [...new Set(warnings)] };
+}
+
+/**
+ * The session a save-time scan looks for. Learning records which of a site's session values are
+ * settings (a theme, a locale: a ref keeps one fresh, it does not make it secret), and a recorded
+ * setting is left out of the scan only when all four hold: it is no JSON container (one carries
+ * credentials whose own refs were dropped, and a refresh can put a new one in); its own text is no
+ * credential; no protected text holds it, in any encoding the scan reads (a setting also sent as a
+ * bearer is a copy of that bearer); and it holds no protected value. Protected is every cookie and
+ * every session value that is not itself a candidate: a credential classification of the same bytes
+ * wins, and no later learn undoes one. A setting that loses its exemption is protected in turn, and
+ * the last two tests are asked again against it until nothing more is protected: the scan reads a few
+ * decoding layers, so a chain of settings would otherwise carry a credential further than any one of
+ * them can. A name no learn classified, an older file's included, is scanned like a credential. This runs twice over:
+ * once where a learn classifies what it stored, over everything it saw live, since a credential it did not store is
+ * gone by the time a save-time scan asks, and a setting it did not store is entered there as a link in that chain
+ * (`sessionRefs`); and at every session write, which records what it keeps
+ * (`recordProtection`), so a rotation cannot take a protection apart.
+ */
+export function credentialsOf(session: Session): Session {
+  const kinds = session.kinds ?? {};
+  const entries = Object.entries(session.values);
+  if (!entries.some(([k]) => kinds[k] === "setting")) return session;
+  const shaped = (v: string) => highEntropy(v) || scanSecrets(v, { cookies: [], values: {} }).warnings.length > 0;
+  // What may be left out at all: a recorded setting that is no container and no credential itself.
+  const candidate = (k: string, v: string) => kinds[k] === "setting" && !jsonContainer(v) && !shaped(v);
+  // Everything a credential classification protects, grown to a fixpoint. A candidate is never
+  // scanned against itself: only what is already protected is on either side of the two tests.
+  const kept = new Set(entries.filter(([k, v]) => !candidate(k, v)).map(([k]) => k));
+  for (let grew = true; grew; ) {
+    grew = false;
+    const values = Object.fromEntries(entries.filter(([k]) => kept.has(k)));
+    const protect: Session = { cookies: session.cookies, values };
+    const texts = [...session.cookies.map((c) => c.value), ...Object.values(values)];
+    const open = entries.filter(([k]) => !kept.has(k));
+    // Both tests as one scan each: a scan's cost is its setup (a live list, each text's decodings), so
+    // asking per value costs as many scans as there are values. The index each side reports names the
+    // value: the label in what a protected text holds, the path in what a value holds.
+    const hit = new Set<number>();
+    const live = Object.fromEntries(open.map(([, v], i) => [String(i), v]));
+    for (const s of scanSecrets(texts, { cookies: [], values: live }).secrets) hit.add(Number(s.split(" ").pop()));
+    for (const s of scanSecrets(
+      open.map(([, v]) => v),
+      protect,
+    ).secrets)
+      hit.add(Number(/^\$\[(\d+)\]/.exec(s)![1]));
+    for (const i of hit) {
+      kept.add(open[i]![0]);
+      grew = true;
+    }
+  }
+  return { ...session, values: Object.fromEntries(entries.filter(([k]) => kept.has(k))) };
 }

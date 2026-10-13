@@ -14,12 +14,20 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { getDomain } from "tldts";
+import { credentialsOf } from "./secrets.js";
 import type { StoredCookie } from "./types.js";
 
 export interface Session {
   cookies: StoredCookie[];
   /** values of session: refs (auth/anti-bot headers), refreshed by every capture */
   values: Record<string, string>;
+  /**
+   * What a learn classified each name in `values` as. A save-time scan skips a "setting"; a name with
+   * no entry, one a file written before the field or a refused add left behind, is scanned like a
+   * credential until a learn classifies it. "credential" is sticky: no later learn downgrades one, and
+   * every write records here what the scan keeps (`recordProtection`), so no rotation undoes it.
+   */
+  kinds?: Record<string, "setting" | "credential">;
   /** where the cookies came from: "<browser>:<profile>" (import), "window", or "file"; drives self-heal re-import */
   source?: string;
   updatedAt?: string;
@@ -129,11 +137,54 @@ export function loadSession(site: string): Session {
   const s = readJson<Partial<Session>>(file, {});
   if (!s || typeof s !== "object" || (s.cookies !== undefined && !Array.isArray(s.cookies)))
     throw new Error(`${file} is not a session file; delete it and log in again`);
-  return { cookies: s.cookies ?? [], values: s.values ?? {}, source: s.source, updatedAt: s.updatedAt };
+  return {
+    cookies: s.cookies ?? [],
+    values: s.values ?? {},
+    ...(s.kinds ? { kinds: s.kinds } : {}),
+    source: s.source,
+    updatedAt: s.updatedAt,
+  };
 }
 
-export function saveSession(site: string, s: Session): void {
-  writePrivate(sessionFile(site), JSON.stringify({ ...s, updatedAt: new Date().toISOString() }, null, 1));
+/**
+ * The protection the save-time scan computes lives in the values, not in the file: it keeps a setting
+ * that holds a credential, or that a credential holds. Rotating either side (a new bearer, a
+ * re-imported cookie) would undo it, so every setting the scan keeps is recorded as a credential here
+ * -- before the write and after it, since either state can hold the relationship -- and a credential
+ * is sticky. A setting whose own value this write replaces is left alone: the protected text is gone.
+ */
+function recordProtection(site: string, s: Session): Session {
+  if (!s.kinds || !Object.values(s.kinds).includes("setting")) return s; // nothing is exempt: nothing to keep
+  const kinds = { ...s.kinds };
+  const stored = loadSession(site);
+  // A name this write calls a setting that the stored file left unclassified -- a file written before
+  // the field, a refused add -- was scanned there like a credential, so the scan was never asked what
+  // it protected; it is asked now, as the setting this write makes it, or the same write replacing the
+  // other side (a re-imported cookie) would take that relationship apart unseen. A name this write does
+  // not call a setting stays unclassified there, so it goes on protecting.
+  const was: Session = {
+    ...stored,
+    kinds: {
+      ...Object.fromEntries(Object.keys(kinds).flatMap((n) => (kinds[n] === "setting" ? [[n, "setting"]] : []))),
+      ...stored.kinds,
+    },
+  };
+  for (const held of [was, s])
+    for (const name of Object.keys(credentialsOf(held).values))
+      if (held.kinds?.[name] === "setting" && kinds[name] === "setting" && held.values[name] === s.values[name])
+        kinds[name] = "credential";
+  return { ...s, kinds };
+}
+
+/**
+ * Every write of the session file goes through here, so the protection a scan found is never lost.
+ * It returns what it wrote: a caller that goes on scanning with the session it passed in would use
+ * kinds the seal has already overruled, and save a spec this file's own kinds refuse.
+ */
+export function saveSession(site: string, s: Session): Session {
+  const sealed = recordProtection(site, s);
+  writePrivate(sessionFile(site), JSON.stringify({ ...sealed, updatedAt: new Date().toISOString() }, null, 1));
+  return sealed;
 }
 
 const expired = (c: StoredCookie, now: number) => c.expires > 0 && c.expires * 1000 <= now;
@@ -143,6 +194,8 @@ export function mergeCapture(
   site: string,
   cookies: StoredCookie[],
   values: Record<string, string> = {},
+  /** a learn's classification of `values`; without one a name whose value changed is unclassified again */
+  learned?: { settings: string[] },
   now = Date.now(),
 ): Session {
   return withLock(sessionFile(site), () => {
@@ -150,13 +203,25 @@ export function mergeCapture(
     const key = (c: StoredCookie) => `${c.name}\0${c.domain.toLowerCase()}\0${c.path}`;
     const jar = new Map(s.cookies.map((c) => [key(c), c]));
     for (const c of cookies) jar.set(key(c), c);
+    const kinds = { ...s.kinds };
+    // This learn classifies every name it stored, and a credential stays one: a later learn reading the
+    // same name as a setting would otherwise drop the protection the first one established.
+    if (learned)
+      for (const name of Object.keys(values))
+        kinds[name] = learned.settings.includes(name) && kinds[name] !== "credential" ? "setting" : "credential";
+    // A refresh (a trigger run, a recapture) replaces values without classifying them, and the page can
+    // put anything in a name a learn once read as a setting: a changed value is unclassified again, so the
+    // scan protects it until a learn reads it. An unchanged one keeps its kind, and a credential stays one.
+    else
+      for (const [name, value] of Object.entries(values))
+        if (kinds[name] === "setting" && s.values[name] !== value) delete kinds[name];
     const merged = {
       cookies: [...jar.values()].filter((c) => !expired(c, now)),
       values: { ...s.values, ...values },
       source: s.source,
+      ...(Object.keys(kinds).length ? { kinds } : {}),
     };
-    saveSession(site, merged);
-    return merged;
+    return saveSession(site, merged);
   });
 }
 

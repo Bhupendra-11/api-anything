@@ -98,6 +98,39 @@ test("session store: API_ANYTHING_HOME override, 0700 dirs, 0600 files, merge by
     ["two"],
   );
   assert.deepEqual(s.values, { authorization: "Bearer A", "x-guest-token": "123" });
+  assert.equal(s.kinds, undefined);
+  // A learn classifies every value it stored. A merge without a classification records nothing new.
+  assert.deepEqual(mergeCapture("x", [], { theme: "dark", at: "T" }, { settings: ["theme"] }).kinds, {
+    theme: "setting",
+    at: "credential",
+  });
+  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB" }).kinds, { theme: "setting", at: "credential" });
+  // a name no learn classified yet becomes a setting when one reads it as one...
+  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB" }, { settings: ["locale"] }).kinds, {
+    theme: "setting",
+    at: "credential",
+    locale: "setting",
+  });
+  // ...but a credential stays one, however a later learn reads the same name
+  assert.deepEqual(mergeCapture("x", [], { at: "T", theme: "dark" }, { settings: ["at", "theme"] }).kinds, {
+    theme: "setting",
+    at: "credential",
+    locale: "setting",
+  });
+  assert.deepEqual(mergeCapture("x", [], { theme: "dark" }, { settings: [] }).kinds, {
+    theme: "credential",
+    at: "credential",
+    locale: "setting",
+  });
+  // A refresh replaces values without classifying them: a value read back unchanged keeps its kind, and
+  // a credential stays one whatever the page now puts there...
+  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB", at: "T2", theme: "x" }).kinds, {
+    theme: "credential",
+    at: "credential",
+    locale: "setting",
+  });
+  // ...but a setting whose value changed is unclassified again, so the scan protects the new text
+  assert.deepEqual(mergeCapture("x", [], { locale: "de-DE" }).kinds, { theme: "credential", at: "credential" });
   assert.deepEqual(
     loadSession("x").cookies.map((k) => k.value),
     ["two"],

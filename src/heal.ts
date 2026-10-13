@@ -22,7 +22,7 @@ import {
 
 export { unplaced };
 
-import { scanSecrets } from "./secrets.js";
+import { credentialsOf, scanSecrets } from "./secrets.js";
 import {
   cookieHeaderFor,
   home,
@@ -631,7 +631,7 @@ function saveOperation(
   }
 
   const allowed = new Set((operation.public ?? []).map((h) => `$.request.headers.${h}`));
-  const secrets = scanSecrets(operation, session, allowed).secrets;
+  const secrets = scanSecrets(operation, credentialsOf(session), allowed).secrets;
   if (secrets.length) throw new Error(`refusing to save a spec containing a credential: ${secrets.join("; ")}`);
   // Re-read under the lock: another add or a heal may have saved this site since we started.
   let replaced = false;
@@ -784,7 +784,7 @@ export async function addOperation(input: AddInput): Promise<AddResult> {
     ...(prior && !run2 && prior.minTier > learned.operation.minTier ? { minTier: prior.minTier } : {}),
     response: withRecipe(learned.operation.response, r),
   };
-  const session = mergeCapture(i.site, (run2 ?? run1).cookies, learned.sessionValues);
+  const session = mergeCapture(i.site, (run2 ?? run1).cookies, learned.sessionValues, learned);
 
   // Values that differ between two page loads are often session-scoped ids, not per-request
   // signatures. One replay of run 1's template with example 2's args tells them apart.
@@ -1009,7 +1009,7 @@ function saveHealed(
   attempt: Attempt,
 ): HealResult {
   const allowed = new Set((op.public ?? []).map((h) => `$.request.headers.${h}`));
-  const secrets = scanSecrets(op, loadSession(site), allowed).secrets;
+  const secrets = scanSecrets(op, credentialsOf(loadSession(site)), allowed).secrets;
   if (secrets.length)
     return {
       outcome: "failed",
@@ -1139,6 +1139,7 @@ export async function healOperation(
   const fallback = op.readOnly && learnArgs === callArgs && run.matched ? judgeExchange(op, run.matched) : undefined;
   let fresh: Operation;
   let sessionValues: Record<string, string>;
+  let settings: string[];
   // Where the op fills each param: a place the page filled with its own value can keep it (learn's paramSlots).
   const was = walk(op.request);
   const wasThere = new Map(was.map((l) => [JSON.stringify(l.at), l]));
@@ -1160,7 +1161,11 @@ export async function healOperation(
     ];
   });
   try {
-    ({ operation: fresh, sessionValues } = learnOperation({
+    ({
+      operation: fresh,
+      sessionValues,
+      settings,
+    } = learnOperation({
       exchanges: run.capture.exchanges,
       pages: capturePages(run.capture),
       examples: [learnArgs],
@@ -1178,7 +1183,7 @@ export async function healOperation(
     return { outcome: "failed", attempt: last, fallback, reason: `re-learning failed: ${(e as Error).message}` };
   }
   // A deploy that adds an auth/anti-bot header: its value is needed to validate (and later send) the candidate.
-  mergeCapture(site, [], sessionValues);
+  mergeCapture(site, [], sessionValues, { settings });
   // An arg equal to a constant the old template had there ("search" in /api/search) is not a param position.
   const oldLeaves = new Map(walk(op.request).map((l) => [JSON.stringify(l.at), l.value.toLowerCase()]));
   const oldSlots = new Set(op.slots.map((sl) => JSON.stringify(sl.at)));
