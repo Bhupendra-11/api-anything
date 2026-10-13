@@ -879,26 +879,26 @@ describe("two processes sharing the Chrome profile; signals and zombies", { skip
   test("Ctrl-C mid-capture exits 130 and kills Chrome", async () => {
     let pid = 0;
     // a wait step keeps the capture busy (the SSE page alone no longer holds a capture open)
-    const running = cli(home, ["capture", `${fx.url}/sse-page`, "--steps", BUSY], {
+    const running = cli(home, ["capture", `${fx.url}/sse-page?name=sigint`, "--steps", BUSY], {
       onSpawn: (p) => (pid = p),
       killAfterMs: 30_000,
     });
-    assert.ok(await until(() => chromes(home) > 0, 15_000), "Chrome never started");
+    // Chrome can appear before Playwright installs its signal handlers; the page request proves capture started.
+    assert.ok(await until(() => fx.calls.includes("/sse-page?name=sigint"), 15_000), "capture never started");
     process.kill(pid, "SIGINT");
     const r = await running;
-    assert.equal(r.code, 130);
+    assert.equal(r.code, 130, `signal: ${r.signal}; stderr: ${r.stderr}`);
     assert.ok(await until(() => chromes(home) === 0, 3000), "Chrome processes left on the profile");
   });
 
   test("SIGKILL mid-capture leaves no Chrome behind, and the next run can launch on the profile", async () => {
     let pid = 0;
     // a wait step keeps the capture busy (the SSE page alone no longer holds a capture open)
-    const running = cli(home, ["capture", `${fx.url}/sse-page`, "--steps", BUSY], {
+    const running = cli(home, ["capture", `${fx.url}/sse-page?name=sigkill`, "--steps", BUSY], {
       onSpawn: (p) => (pid = p),
       killAfterMs: 30_000,
     });
-    assert.ok(await until(() => chromes(home) > 0, 15_000), "Chrome never started");
-    await sleep(1000);
+    assert.ok(await until(() => fx.calls.includes("/sse-page?name=sigkill"), 15_000), "capture never started");
     process.kill(pid, "SIGKILL");
     await running;
     assert.ok(await until(() => chromes(home) === 0, 5000), "orphaned Chrome processes on the profile");
@@ -916,16 +916,16 @@ describe("two processes sharing the Chrome profile; signals and zombies", { skip
   test("SIGTERM mid-capture exits promptly", async () => {
     let pid = 0;
     // a wait step keeps the capture busy (the SSE page alone no longer holds a capture open)
-    const running = cli(home, ["capture", `${fx.url}/sse-page`, "--steps", BUSY], {
+    const running = cli(home, ["capture", `${fx.url}/sse-page?name=sigterm`, "--steps", BUSY], {
       onSpawn: (p) => (pid = p),
       killAfterMs: 40_000,
     });
-    assert.ok(await until(() => chromes(home) > 0, 15_000), "Chrome never started");
-    await sleep(2000); // the page is loaded and the capture is waiting for the network to go quiet
+    assert.ok(await until(() => fx.calls.includes("/sse-page?name=sigterm"), 15_000), "capture never started");
     const t0 = Date.now();
     process.kill(pid, "SIGTERM");
     const r = await running;
     assert.ok(Date.now() - t0 < 5000, `exited ${Date.now() - t0} ms after SIGTERM: ${r.stdout.slice(0, 160)}`);
+    assert.ok(await until(() => chromes(home) === 0, 3000), "Chrome processes left on the profile");
   });
 
   test("while an MCP server holds the profile, a CLI capture fails fast with a hint naming the lock", async () => {

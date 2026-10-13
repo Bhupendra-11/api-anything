@@ -1018,7 +1018,8 @@ describe("browser tiers", { skip: !browserAvailable() && "no Chromium browser in
       const query = rd("query", "/twin", { minTier: 2, request, slots });
       saveSite(parseSite({ name: "twin", baseUrl: base, operations: [query] }));
       saveSession("twin", { cookies: [], values: { token: "SECRET-query-token-123" } });
-      const r = await call("twin", "query", {}, { maxTier: 2, minIntervalMs: 0, timeoutMs: 5000 });
+      // This checks redirect safety, not speed: leave room for the runner's concurrent browser tests.
+      const r = await call("twin", "query", {}, { maxTier: 2, minIntervalMs: 0 });
       assert.equal(r.ok, false, JSON.stringify(r));
       assert.match(r.reason ?? "", /not following a redirect from http:\/\/127\.0\.0\.1:\d+: .* cannot be told apart/);
       assert.doesNotMatch(JSON.stringify(r), /SECRET-query-token-123/, "the result carries the session's token");
