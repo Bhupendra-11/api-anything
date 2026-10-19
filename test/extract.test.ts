@@ -153,6 +153,59 @@ test("html recipe via selectors, text and @attr", () => {
   ]);
 });
 
+test("@href/@src values are resolved against the page's final address, without it they stay", () => {
+  const html = `<ul class="x">
+    <li><a href="/u/alice">a</a> <img src="../img/p.png"></li>
+    <li><a href="mailto:me@ex.example">m</a></li>
+    <li><a href="https://other.example/x">o</a></li>
+  </ul>`;
+  const rows = extractHtml(
+    html,
+    { items: "li", fields: { h: "a@href", img: "img@src" } },
+    "http://127.0.0.1:8080/list",
+  );
+  assert.deepEqual(rows, [
+    { h: "http://127.0.0.1:8080/u/alice", img: "http://127.0.0.1:8080/img/p.png" },
+    { h: "mailto:me@ex.example", img: undefined },
+    { h: "https://other.example/x", img: undefined },
+  ]);
+  assert.deepEqual(extractHtml(html, { items: "li", fields: { h: "a@href" } })[0], { h: "/u/alice" });
+});
+
+test("a page's <base href> is what its relative links resolve against, as in a browser", () => {
+  const recipe = { items: "li", fields: { h: "a@href" } };
+  const page = (base: string) => `<head>${base}</head><ul><li><a href="item/1">x</a></li></ul>`;
+  assert.deepEqual(extractHtml(page(`<base href="/app/">`), recipe, "https://h.example/list")[0], {
+    h: "https://h.example/app/item/1",
+  });
+  assert.deepEqual(extractHtml(page(`<base href="https://cdn.example/v2/">`), recipe, "https://h.example/list")[0], {
+    h: "https://cdn.example/v2/item/1",
+  });
+  // a <base> with only a target, or an href that is no URL, leaves the page's own address
+  assert.deepEqual(extractHtml(page(`<base target="_top">`), recipe, "https://h.example/a/list")[0], {
+    h: "https://h.example/a/item/1",
+  });
+  assert.deepEqual(extractHtml(page(`<base href="http://[bad">`), recipe, "https://h.example/a/list")[0], {
+    h: "https://h.example/a/item/1",
+  });
+});
+
+test("a non-address attribute never resolves, even with a page address", () => {
+  const html = `<ul class="x"><li><a href="/u/alice" data-x="rel">a</a></li></ul>`;
+  assert.deepEqual(
+    extractHtml(html, { items: "li", fields: { h: "a@href", x: "a@data-x" } }, "http://h.example/list")[0],
+    { h: "http://h.example/u/alice", x: "rel" },
+  );
+});
+
+test("extract passes the page's final address to an html recipe", () => {
+  const body = `<ul class="x"><li><a href="/u/bob">b</a></li></ul>`;
+  assert.deepEqual(
+    extract({ format: "html", html: { items: "li", fields: { h: "a@href" } } }, body, "http://h.example/list"),
+    [{ h: "http://h.example/u/bob" }],
+  );
+});
+
 test("embedded regex: group 1 marks the JSON start, the scanner finds its end", () => {
   const doc = `<script>AF_initDataCallback({key: 'ds:1', hash: '2', data:[["United",[1,2]],"x]y"], sideChannel: {}});</script>`;
   assert.deepEqual(extractEmbedded(doc, "key: 'ds:1'.*?data:(\\[)"), [["United", [1, 2]], "x]y"]);

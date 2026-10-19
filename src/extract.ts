@@ -180,32 +180,61 @@ export function pick(value: unknown, paths: string[]): unknown {
   return value.map(one).filter((x) => !(x && typeof x === "object" && !Object.keys(x).length));
 }
 
+/** Attribute values that are addresses: a relative one needs the page's own address to be usable. */
+const URL_ATTRS = new Set(["href", "src"]);
+
+/** Relative value resolved against the page's final address; otherwise the value untouched. */
+const address = (v: string, attr: string, base: string): string => {
+  if (!URL_ATTRS.has(attr.toLowerCase())) return v;
+  try {
+    return new URL(v, base).href;
+  } catch {
+    return v; // not a URL on its own: a relative junk value stays readable
+  }
+};
+
+/** What a browser resolves the page's links against: its first `<base href>`, else its own address. */
+function documentBase(doc: HTMLElement, url: string): string {
+  const href = doc.querySelector("base[href]")?.getAttribute("href");
+  try {
+    return href ? new URL(href, url).href : url;
+  } catch {
+    return url;
+  }
+}
+
 /**
  * `fields` values are "<css>" (text) or "<css>@attr"; an empty css means the item itself.
  * An "all:" prefix returns every match as a list (a book's genres, a post's tags), [] when none.
+ * `base` (the page's final address, redirects included) makes `@href`/`@src` values usable as-is:
+ * a relative link is resolved against it (or the page's `<base href>`), a scheme-carrying value stays.
  */
 export function extractHtml(
   body: string,
   recipe: { items: string; fields: Record<string, string> },
+  base?: string,
 ): Record<string, string | string[] | undefined>[] {
-  return parseHtml(body)
-    .querySelectorAll(recipe.items)
-    .map((el) => {
-      const out: Record<string, string | string[] | undefined> = {};
-      for (const [name, field] of Object.entries(recipe.fields)) {
-        const all = field.startsWith("all:");
-        const sel = all ? field.slice(4) : field;
-        const m = /^(.*?)@([\w:-]+)$/.exec(sel);
-        const css = (m ? m[1]! : sel).trim();
-        const value = (t: HTMLElement) => (m ? t.getAttribute(m[2]!) : t.text.replace(/\s+/g, " ").trim());
-        if (all) out[name] = (css ? el.querySelectorAll(css) : [el]).map(value).filter((v): v is string => !!v);
-        else {
-          const target = css ? el.querySelector(css) : el;
-          out[name] = target ? value(target) : undefined;
-        }
+  const doc = parseHtml(body);
+  base &&= documentBase(doc, base);
+  return doc.querySelectorAll(recipe.items).map((el) => {
+    const out: Record<string, string | string[] | undefined> = {};
+    for (const [name, field] of Object.entries(recipe.fields)) {
+      const all = field.startsWith("all:");
+      const sel = all ? field.slice(4) : field;
+      const m = /^(.*?)@([\w:-]+)$/.exec(sel);
+      const css = (m ? m[1]! : sel).trim();
+      const value = (t: HTMLElement): string | undefined => {
+        const raw = m ? t.getAttribute(m[2]!) : t.text.replace(/\s+/g, " ").trim();
+        return raw && base && m ? address(raw, m[2]!, base) : raw;
+      };
+      if (all) out[name] = (css ? el.querySelectorAll(css) : [el]).map(value).filter((v): v is string => !!v);
+      else {
+        const target = css ? el.querySelector(css) : el;
+        out[name] = target ? value(target) : undefined;
       }
-      return out;
-    });
+    }
+    return out;
+  });
 }
 
 /** JSON embedded in a document; the regex's group 1 marks where the JSON value starts. */
@@ -225,9 +254,9 @@ export function extractEmbedded(body: string, regex: string): unknown {
 }
 
 /** Body -> extracted value per the op's response spec. Undefined when the extract path is missing. */
-export function extract(res: ResponseSpec, body: string): unknown {
+export function extract(res: ResponseSpec, body: string, base?: string): unknown {
   let data: unknown;
-  if (res.format === "html") data = res.html ? extractHtml(body, res.html) : body;
+  if (res.format === "html") data = res.html ? extractHtml(body, res.html, base) : body;
   else if (res.format === "embedded") data = res.embedded ? extractEmbedded(body, res.embedded.regex) : undefined;
   else data = parseBody(body, res.xssiPrefix);
   if (res.extract && data !== undefined) data = getPath(data, res.extract);
