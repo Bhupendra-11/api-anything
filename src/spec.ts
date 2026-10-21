@@ -146,6 +146,12 @@ export const SiteSchema = z.object({
   /** cookie names whose presence means logged in (overrides the heuristic) */
   loginCookies: z.array(z.string()).optional(),
   operations: z.array(OperationSchema).default([]),
+  /**
+   * Where `pull` fetched this spec from. A spec that carries it is someone else's wherever it is
+   * saved now (a heal writes a user copy): it is checked against the shared rules on every load,
+   * and its heals do not rescan.
+   */
+  shared: z.object({ from: z.string(), sha256: z.string() }).optional(),
 });
 
 export type Request = z.infer<typeof RequestSchema>;

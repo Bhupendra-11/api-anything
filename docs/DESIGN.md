@@ -276,7 +276,9 @@ Input: the captured exchanges plus one or two example arg sets. Output: an Opera
    earlier answer). Export scans a
    spec again, by name and by shape, before it is shared. At call time a `cookie:` ref takes the
    cookie sent to the request URL, else one of the same registrable domain (by the Public Suffix
-   List, private section included: co.uk, github.io and run.app are suffixes), never another site's.
+   List, private section included: co.uk, github.io and run.app are suffixes) that is not HttpOnly,
+   never another site's. A `session:` ref takes its value only for a request to the host the value
+   was captured from (see Sharing specs).
    The same `siteOf` scopes Set-Cookie domains, the profile's exported cookies and browser import. A header or field name a human marks public
    (`add --public authorization` for a web app's shared bearer) is listed by the op in `public`
    and keeps literal what these rules would take by that name: a header by its name (`authorization`, `x-csrf-token`),
@@ -617,8 +619,9 @@ payloads are out of scope for v1.
 
 One JSON file per site: `{ name, displayName, baseUrl, description, operations[] }`, zod-validated.
 Site names are case-insensitive (lower-cased), so one file never gets two sets of state.
-Resolution order: `~/.api-anything/sites/<site>.json` (user-created and healed copies win) → the
-bundled `sites/<site>.json` (community). A heal of a bundled spec writes a user copy.
+Resolution order: `~/.api-anything/sites/<site>.json` (user-created and healed copies win) → a
+pulled `~/.api-anything/registry/<site>.json` → the bundled `sites/<site>.json` (community). A heal
+of a pulled or bundled spec writes a user copy.
 `api-anything export <site>` writes a shareable copy. It strips examples (unless `--keep-examples`:
 a human confirmed they are public, so `verify` works for others) and samples (response shapes,
 whose keys can be user data; typed example values in the request become null), and it runs an
@@ -628,6 +631,121 @@ heuristics. It also refuses any literal the learner would have made a ref (a ses
 header, a random value under a credential's name), and warns about a literal IP address (a client
 `remoteHost` the page reported), whole or inside a longer leaf (`ip:port`, an x-forwarded-for list,
 `ip=` text; a version string after a letter or `/`, or one ending in `.0`, is not one). Names an op lists in `public` are allowed.
+
+## Sharing specs (`registry.ts`, `publish.ts`, `vet.ts`)
+
+Someone who reverse-engineered a site publishes the spec; anyone else pulls it instead of learning it
+again. The registry is this repository's `sites/` directory on GitHub: a contribution is a pull
+request, a maintainer reviews it, and CI runs the same rules `pull` runs. The npm package's bundled
+`sites/` is a snapshot of it; `pull` gets what merged since the release. No server of our own, no
+GitHub token handled by api-anything, nothing sent without the user asking.
+
+**Never automatic.** Sharing is one command after a human looked at a preview. A spec learned from
+a logged-in session encodes things no scan can tell from public constants (an account id in a path,
+an intranet host, what the person uses), so nothing uploads on its own.
+
+**Trust model.** A spec is executable configuration: it names the URLs a call sends the user's
+cookies and session values to, the pages a browser holding the user's sessions opens and what it
+clicks there, and whether an op writes. The registry's specs are trusted as the bundled ones are,
+because a maintainer reviewed them like code; `API_ANYTHING_REGISTRY` points at another repository
+only for someone who trusts it the same way. The local rules below are defense in depth for a review
+that missed something, not a sandbox for anonymous specs.
+
+**What keeps a pulled spec from turning the user's sessions against them:**
+
+- *A session value goes only back to the host it was captured from.* The session records the host
+  of the request each value was sent in (`Session.valueHosts`), set with the value in one write, and a
+  `session:` ref resolves only for a request to that host. So a spec cannot point a request at
+  another host, or a sibling host of the site, and carry a bearer the trigger just captured from the
+  real one; the value is simply missing there. A value from before the field has no host: it is sent
+  as before for the user's own specs, and dropped from the session by `pull` and before the first call
+  or forced heal of any spec the user did not write (pulled, bundled, or a heal's copy of a pulled one); the next
+  trigger run captures it again, bound.
+- *A cookie ref's site fallback never takes an HttpOnly cookie.* The fallback (a cookie of
+  www.site.com echoed to api.site.com) models page script copying a cookie, and no script can read an
+  HttpOnly one; without the rule a host-only session cookie would reach every host of its site.
+- *Provenance survives a heal.* `pull` stamps the spec with `shared: {from, sha256}`. A heal writes
+  a user copy that keeps it, and `loadSite` runs the shared rules on every spec that has it or lives
+  in the registry directory, so tightened rules reach copies too; a registry file without it is no
+  file pull wrote, and is refused. `export` and `publish` strip it. A bundled spec ships inside the
+  package and is trusted as its code is: it keeps rescan.
+- *A shared spec heals by recapture only.* A rescan sends a token it found in the site's own pages to
+  the op's request URL before any check, and the spec chose that URL.
+- *A shared spec's trigger run keeps a redirect of the op's own request on its site.* `readGuard`
+  lets an unsafe redirect hop of the op's own request through on any origin (a signed read checked
+  elsewhere with a 307); for a shared spec, a hop to another site is aborted, before the steps run too.
+- *Writes stay gated.* `allowWrites` is required at every entry point, whatever the spec's source.
+- *Text is data.* Notes, descriptions and hints reach the calling agent; `ops` and MCP
+  `list_operations` say beside a shared spec's that someone else wrote them and they are not
+  instructions. Op and param names, which `next` hints spell in commands, are restricted.
+
+**The shared rules** (`vetShared`), run on pull, on publish, on load, and by CI over `sites/`.
+Errors refuse: every URL an op sends to or opens (request, trigger, soft-from, `goto` value or
+selector) is https on a host under a public suffix (no IP, `localhost`, single-label or
+`.local`/`.internal`-style name), and so is `baseUrl`; no literal credential in a request (the
+export rule) outside the op's `public` names; `readOnly` only on GET, HEAD and POST, never on a
+GraphQL document defining a mutation or subscription (read from a JSON body, a batch, a form, the URL
+or a raw `application/graphql` body, by each definition's operation type, with comments, strings and
+block strings skipped: `query mutation { }` is a query), never with a param as the whole body (raw,
+base64, the JSON root or a batch item: the caller would write the request), and never on a GraphQL
+request whose document a param fills; a `match` naming a host, path or operationName (the match is what a trigger run
+lets through as the op's own request); op and param names a letter then letters, digits, `_ . -`;
+regexes (`pick` `~`, `embedded`, param `pattern`) at most 200 characters with no quantified group
+inside a quantified group; at most 50 operations, descriptions and hints at most 500 characters,
+notes at most 8 KB, the file at most 256 KB. Warnings, shown to the human and put in the pull
+request for the reviewer: reads sent as POST, writes, ops learned logged in, literal `public` values
+(a shared bearer makes every user's calls that account's), requests or triggers off the spec's own
+site (Algolia behind Hacker News, AppSync behind Goodreads), and the export scan's shape heuristics.
+
+**What the rules do not cover, so review does.** A read sent as GET or as a non-GraphQL POST can
+still change something; trigger steps can click what the page lets them before `readGuard` acts on
+the page's own unsafe requests, and page script at tier 2 and 3 sends what it likes with the
+browser's cookies; the regex rule catches the common catastrophic shapes and is no bound on run time
+(`(a|aa)+` passes); hostnames are checked, not what they resolve to, so a public name pointing at a
+private address is not refused; shared workers are not guarded (see Browser).
+
+**Pull.** `api-anything pull <site>` fetches `sites/<site>.json` (and `<site>.md` if present) from
+`https://raw.githubusercontent.com/goodnight000/api-anything/main` (`API_ANYTHING_REGISTRY`
+overrides: https, or http to localhost for tests), with redirects refused, a size cap read while
+streaming, and a timeout. It parses the spec (unknown fields stripped), checks its name is the one
+asked for, runs `vetShared`, and writes it to `~/.api-anything/registry/<site>.json` with its notes,
+notes first. Resolution is user → registry → bundled. It refuses when a local spec or session of that
+name belongs to another site (one name is one session), and reports when the user's own copy
+shadows the pulled one. Output: each op (`name(params) -> fields`, method, hosts, write, login), the
+warnings, and what changed since the last pull. A call or `ops` for a site that does not exist says
+`next: api-anything pull <site>` before suggesting `capture`.
+
+**Publish.** `api-anything publish <site>` builds the export (examples, shapes, `learnedAt` and
+`shared` stripped; examples kept with `--keep-examples`) and refuses on any live secret, with no
+`--force`: the export's scan, plus a second exact scan of the spec and the notes against this
+machine's cookies and session values that no `public` name waives (a public name keeps a shared
+bearer out of the shape heuristics, never out of this), run over the exact bytes of the outgoing
+files so a key is read as well as a value; and it refuses a spec over pull's 256 KB. It runs `vetShared`, and lists what may be
+the publisher's own for them alone, never in the pull request: an email address, a UUID or a
+literal IP anywhere in the spec (keys included) or the notes, a run of 5+ digits in a URL path no param
+fills, a literal typed by a `fill` step, a param default. Without `--yes` it stops after the preview:
+the exact files written to `~/.api-anything/outbox/`, what was stripped, every warning, and that the
+pull request is public under the user's GitHub account. `--yes` makes the plan again and sends it
+only if it hashes to the preview's, so what the human approved is what is sent. Sending is the
+GitHub REST API through the GitHub CLI (`gh api`, `API_ANYTHING_GH` overrides the binary): fork the
+registry, sync the fork, create a branch `share/<site>-<hash>` from the registry's main, put each
+file with the account's noreply address as author and committer (not the user's git email), and
+open the pull request with the ops and warnings as its body. Nothing is cloned, so no hook, filter
+or symlink of a repository runs; every call has fixed arguments with its body as JSON on stdin; what
+`gh` answers is checked against the shape expected before it is used in a path. A second run with
+the same content reuses the branch and reports the open pull request. A failure after a file
+may have reached the fork (an upload whose answer was lost counts) says the files may be public
+there, and on which branch. The agent skill shows the
+preview to the user and runs `--yes` only on their explicit OK.
+
+**Nudges, not automation.** Once `verify <site>` passes for a site the user learned, its output
+says it can be shared (`next: api-anything publish <site>`). The skill tells the agent to try `pull`
+before `capture`.
+
+Not in this version: search across the registry (an index file CI keeps in sync), signed or
+commit-pinned pulls, health reports from users' calls, runtime checks of resolved addresses, a
+bounded regex engine, and MCP `pull`/`publish` (MCP cannot create operations; pulling one is
+creating one).
 
 ## Logging in (`login.ts`, `import.ts`)
 
@@ -744,5 +862,5 @@ independent alternative.
 ## Non-goals (v1)
 
 TLS impersonation transports, CAPTCHA solving, signature reimplementation, seroval parsing,
-a hosted registry or marketplace, typed-client codegen, and Windows app-bound cookie decryption
+a hosted registry service or marketplace (sharing is pull requests to `sites/`, see above), typed-client codegen, and Windows app-bound cookie decryption
 (login falls back to `--window` there).

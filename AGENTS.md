@@ -20,6 +20,8 @@ holds the evidence behind it, including the api-anything bugs that must not come
 | `src/heal.ts` | add, rescan, recapture, tier-3 trigger runs, captures |
 | `src/execute.ts` | `call()`: the tier ladder, classifier actions, heal guards, write rules |
 | `src/session.ts`, `src/store.ts` | `~/.api-anything`: cookie jar, specs, heal log, state, export |
+| `src/vet.ts` | the shared rules a spec someone else wrote must pass: on pull, publish, load and in CI |
+| `src/registry.ts`, `src/publish.ts` | pull a shared spec from the registry (`sites/` on GitHub); publish one as a pull request via `gh` |
 | `src/login.ts`, `src/import.ts` | sign in by importing the everyday browser's cookies; re-import on `auth` |
 | `src/cli.ts`, `src/mcp.ts`, `src/index.ts` | entry points |
 
@@ -32,6 +34,8 @@ holds the evidence behind it, including the api-anything bugs that must not come
   retry only on 400/401/403/404. Require `allowWrites` at every entry point.
 - No site-specific code in `src/`. Add the pattern to `test/fixture/server.ts` instead.
 - Healing is reactive: always send the stored template first.
+- A spec in `sites/` must pass `vetShared` (`test/registry.test.ts` checks every one): pulled specs
+  run with other people's sessions.
 - Tests use `node:test` and never touch the network beyond localhost.
 
 ## Commands

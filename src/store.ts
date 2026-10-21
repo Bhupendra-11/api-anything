@@ -1,33 +1,48 @@
-/** Site specs (user dir wins over bundled), heal log, stale marks, and remembered tiers. */
+/** Site specs (user dir, then pulled, then bundled), heal log, stale marks, and remembered tiers. */
 import { appendFileSync, chmodSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setAt, walk } from "./codec.js";
-import { besideOrigins, credentialsOf, ipIn, isCredential, leafName, opUrls, scanSecrets } from "./secrets.js";
+import { type Leaf, setAt, walk } from "./codec.js";
+import { besideOrigins, credentialsOf, ipIn, leafName, literalCredentials, opUrls, scanSecrets } from "./secrets.js";
 import { ensureDir, home, loadSession, readJson, safeName, withLock, writePrivate } from "./session.js";
 import { parseSite, type Site } from "./spec.js";
+import { vetShared } from "./vet.js";
 
 export const BUNDLED_DIR = fileURLToPath(new URL("../sites", import.meta.url));
 export const userSitesDir = () => join(home(), "sites");
+/** Specs `pull` fetched from the registry: someone else's, so checked again on every load. */
+export const registryDir = () => join(home(), "registry");
 
 export interface Resolved {
   site: Site;
-  source: "user" | "bundled";
+  source: "user" | "registry" | "bundled";
   path: string;
 }
+
+const specDirs = (bundledDir: string) =>
+  [
+    [userSitesDir(), "user"],
+    [registryDir(), "registry"],
+    [bundledDir, "bundled"],
+  ] as const;
 
 export function loadSite(name: string, bundledDir = BUNDLED_DIR): Resolved | undefined {
   name = safeName(name);
   const file = `${name}.json`;
-  for (const [dir, source] of [
-    [userSitesDir(), "user"],
-    [bundledDir, "bundled"],
-  ] as const) {
+  for (const [dir, source] of specDirs(bundledDir)) {
     const path = join(dir, file);
     if (!existsSync(path)) continue;
     try {
       // The file name is the site's address; saving under a different inner name would overwrite another site.
-      return { site: { ...parseSite(JSON.parse(readFileSync(path, "utf8"))), name }, source, path };
+      const site = { ...parseSite(JSON.parse(readFileSync(path, "utf8"))), name };
+      // someone else's spec, pulled or a heal's copy of one, meets the rules of today, not of its pull
+      // pull writes the record with every spec, so one without it is no spec pull wrote
+      if (source === "registry" && !site.shared) throw new Error("a pulled spec without its record; pull it again");
+      if (source === "registry" || site.shared) {
+        const { errors } = vetShared(site, notesAt(join(dir, `${name}.md`)));
+        if (errors.length) throw new Error(`a pulled spec that fails the shared rules: ${errors.join("; ")}`);
+      }
+      return { site, source, path };
     } catch (e) {
       throw new Error(`${path}: ${(e as Error).message}`);
     }
@@ -41,18 +56,20 @@ export function loadSite(name: string, bundledDir = BUNDLED_DIR): Resolved | und
  * from there on the file is for people working on the spec.
  */
 export function siteNotes(name: string, bundledDir = BUNDLED_DIR): string | undefined {
-  for (const dir of [userSitesDir(), bundledDir]) {
-    const path = join(dir, `${safeName(name)}.md`);
-    if (!existsSync(path)) continue;
-    const [forCallers] = readFileSync(path, "utf8").split(/^## Maintainer notes\s*$/im);
+  for (const [dir] of specDirs(bundledDir)) {
+    const text = notesAt(join(dir, `${safeName(name)}.md`));
+    if (text === undefined) continue;
+    const [forCallers] = text.split(/^## Maintainer notes\s*$/im);
     return forCallers!.trim();
   }
   return undefined;
 }
 
+const notesAt = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : undefined);
+
 export function listSites(bundledDir = BUNDLED_DIR): string[] {
   const names = new Set<string>();
-  for (const dir of [userSitesDir(), bundledDir]) {
+  for (const [dir] of specDirs(bundledDir)) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) if (f.endsWith(".json")) names.add(f.slice(0, -5));
   }
@@ -198,6 +215,9 @@ export function exportSite(
   const r = loadSite(name);
   if (!r) throw new Error(`no site "${name}"`);
   const spec = structuredClone(r.site);
+  // where this copy was pulled from, and when an op was learned, are this machine's history
+  delete spec.shared;
+  for (const op of spec.operations) delete op.learnedAt;
   const allowed = new Set<string>();
   const named: [string, string][] = [];
   const ips: string[] = [];
@@ -216,22 +236,20 @@ export function exportSite(
     delete op.response.shape;
     const pub = new Set((op.public ?? []).map((h) => h.toLowerCase()));
     for (const h of pub) allowed.add(`$.operations[${i}].request.headers.${h}`);
-    // Learning makes these refs; a literal one is a hand-written or older spec's credential.
-    for (const leaf of walk(op.request)) {
-      if (leaf.type !== "string" || leaf.container) continue;
+    const where = (leaf: Leaf) => `$.operations[${i}].request ${leaf.at.join(" > ")}`;
+    for (const leaf of literalCredentials(op.request, pub)) {
       const root = leaf.at[0]!;
-      const path = `$.operations[${i}].request.${root.startsWith("header:") ? `headers.${root.slice(7)}` : /^(path|query)/.test(root) ? "url" : "body"}`;
-      const where = `$.operations[${i}].request ${leaf.at.join(" > ")}`;
       const n = leafName(leaf.at);
-      if (!pub.has(n.toLowerCase()) && isCredential(n, leaf.value))
-        named.push([
-          path,
-          `${where} holds a literal credential (${n}); make it a session: ref, or list ${n} in the op's public names if the site ships it to everyone`,
-        ]);
-      const ip = ipIn(leaf.value);
+      named.push([
+        `$.operations[${i}].request.${root.startsWith("header:") ? `headers.${root.slice(7)}` : /^(path|query)/.test(root) ? "url" : "body"}`,
+        `${where(leaf)} holds a literal credential (${n}); make it a session: ref, or list ${n} in the op's public names if the site ships it to everyone`,
+      ]);
+    }
+    for (const leaf of walk(op.request)) {
+      const ip = leaf.type === "string" && !leaf.container ? ipIn(leaf.value) : undefined;
       if (ip)
         ips.push(
-          `${where} holds the IP address ${ip} (likely yours, as the page reported it); blank it if the site does not need it`,
+          `${where(leaf)} holds the IP address ${ip} (likely yours, as the page reported it); blank it if the site does not need it`,
         );
     }
   });

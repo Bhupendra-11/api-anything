@@ -23,10 +23,13 @@ import { AmbiguousProfile } from "./import.js";
 import { type Candidate, capturePages, pageUrls, rankCandidates } from "./learn.js";
 import { cookieNames, importSession, logout, resolveLoginTarget } from "./login.js";
 import { type Outline, outline } from "./outline.js";
+import { plan, submit, writeOutbox } from "./publish.js";
+import { pull } from "./registry.js";
 import { loadSession, loggedIn, saveSession, sessionFile, withLock } from "./session.js";
 import { HtmlRecipeSchema, MatchSchema, type Operation, TriggerStepSchema } from "./spec.js";
 import { exportSite, listSites, loadSite, siteNotes } from "./store.js";
 import type { Exchange, TriggerStep } from "./types.js";
+import { SHARED_NOTE } from "./vet.js";
 
 const VERSION = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string })
   .version;
@@ -123,6 +126,20 @@ const HELP: Record<string, string> = {
   export: `api-anything export <site> [--out <file>] [--keep-examples] [--force]
   Writes a shareable spec: examples and response shapes stripped, and refused if a live cookie or
   session value is inside. --keep-examples keeps param examples you confirmed are public (so verify works).`,
+  pull: `api-anything pull <site>
+  Fetches a spec someone shared from the registry (the api-anything repo's sites/ on GitHub) into
+  ~/.api-anything/registry, so you can call it without learning it. Someone else wrote it: it is
+  checked against the shared rules first, and its writes still need --allow-writes. Prints each op
+  (method, hosts, write, login) and the warnings a human should read; a pull again names what changed.
+  API_ANYTHING_REGISTRY overrides the registry's base URL.`,
+  publish: `api-anything publish <site> [--keep-examples] [--yes]
+  Shares a spec you learned: opens a pull request adding it to the registry, so others can pull it
+  instead of learning the site again. Without --yes it only previews: the exact files that would be
+  public (written to ~/.api-anything/outbox), what was stripped, the warnings, and what may be yours
+  (an email, an account id, a literal typed into the page). It refuses a spec holding a live cookie or
+  session value. --yes sends that preview, unchanged, with the GitHub CLI (gh, signed in): a fork, a
+  branch, commits under your account's noreply address, and a public pull request under your account.
+  --keep-examples keeps param examples you confirmed are public (so verify works for others).`,
   mcp: `api-anything mcp [--allow-writes]
   Serves list_sites, list_operations, call_operation and login over stdio MCP. MCP cannot create
   operations (use capture/add here), and its login only refreshes a session a human imported here.`,
@@ -136,6 +153,7 @@ const USAGE = `api-anything ${VERSION}: turn a website into operations an agent 
   api-anything add <site> <op> --trigger <url-template> --example k=v [--example2 k=v] [--write]
   api-anything call <site> <op> [k=v ...] [--allow-writes]
   api-anything inspect <captureId> [<requestId>]
+  api-anything pull <site> | publish <site> [--yes]
   api-anything verify [site] | sites | ops <site> | heal <site> <op> | export <site> | mcp
 
 api-anything <command> --help for details. Data lives in ~/.api-anything (API_ANYTHING_HOME overrides).`;
@@ -202,7 +220,11 @@ const needBrowser = () => {
 function requireSite(name: string | undefined) {
   if (!name) throw new Fail("missing <site>", "api-anything sites");
   const r = loadSite(name);
-  if (!r) throw new Fail(`no site "${name}"`, "api-anything sites lists what exists; api-anything add creates one");
+  if (!r)
+    throw new Fail(
+      `no site "${name}"`,
+      `api-anything pull ${name} fetches it if someone shared it; else api-anything capture and add learn it`,
+    );
   return r;
 }
 
@@ -237,6 +259,7 @@ const OPTIONS = {
   limit: { type: "string" },
   out: { type: "string" },
   force: { type: "boolean" },
+  yes: { type: "boolean" },
   window: { type: "boolean" },
   cookies: { type: "string" },
   profile: { type: "string" },
@@ -697,7 +720,16 @@ async function cmdVerify({ pos }: Parsed): Promise<number> {
     }
   }
   const ok = results.every((r) => r.ok);
-  out({ ok, results });
+  const own = pos[0] ? loadSite(pos[0]) : undefined;
+  // a site the user learned and just saw work is one others could use
+  const share = ok && own?.source === "user" && !own.site.shared;
+  out({
+    ok,
+    results,
+    ...(share
+      ? { next: `api-anything publish ${own.site.name} previews sharing it, so others need not learn it` }
+      : {}),
+  });
   if (!ok) process.stderr.write("next: follow each failing op's own next hint once, then report what still fails\n");
   return ok ? 0 : 1;
 }
@@ -743,6 +775,7 @@ function cmdOps({ pos }: Parsed): number {
       ...(o.minTier > 1 ? { minTier: o.minTier } : {}),
       trigger: o.trigger.url,
     })),
+    ...(site.shared ? { shared: SHARED_NOTE } : {}),
     ...(notes ? { notes } : {}),
   });
   return 0;
@@ -774,6 +807,79 @@ function cmdExport({ v, pos }: Parsed): number {
     writeFileSync(v.out, text);
     out({ ok: true, out: v.out, warnings: r.warnings.length });
   } else process.stdout.write(text);
+  return 0;
+}
+
+async function cmdPull({ pos }: Parsed): Promise<number> {
+  if (!pos[0]) throw new Fail("missing <site>", "api-anything pull <site>");
+  let r: Awaited<ReturnType<typeof pull>>;
+  try {
+    r = await pull(pos[0]);
+  } catch (e) {
+    const missing = /^no shared spec/.test((e as Error).message);
+    throw new Fail(
+      (e as Error).message,
+      missing
+        ? `nobody shared ${pos[0]} yet: learn it with api-anything capture and add, then share it with api-anything publish`
+        : "do not edit the pulled spec to get past this; learn the site with capture and add instead",
+    );
+  }
+  out({
+    ok: true,
+    ...r,
+    next: r.shadowedBy
+      ? `your own copy ${r.shadowedBy} wins over the pulled one; delete it to use the pulled spec`
+      : `read the warnings with the user before the first call; api-anything ops ${r.site} lists the ops`,
+  });
+  return 0;
+}
+
+async function cmdPublish({ v, pos }: Parsed): Promise<number> {
+  const { site } = requireSite(pos[0]);
+  const keepExamples = v["keep-examples"];
+  const again = `api-anything publish ${site.name}${keepExamples ? " --keep-examples" : ""}`;
+  if (!v.yes) {
+    const p = plan(site.name, { keepExamples });
+    if (p.errors.length)
+      throw new Fail(
+        `refusing to publish ${p.site}: ${p.errors.length} problem(s)`,
+        "fix each one (a live value: re-add the op so learning makes it a ref) and preview again",
+        { errors: p.errors },
+      );
+    out({
+      ok: true,
+      site: p.site,
+      files: writeOutbox(p),
+      operations: p.operations,
+      stripped: p.stripped,
+      warnings: p.warnings,
+      personal: p.personal,
+      public: "the files and the pull request are public, under your GitHub account",
+      next: `show the user the files and every warning and personal item; only with their explicit OK: ${again} --yes`,
+    });
+    return 0;
+  }
+  let r: Awaited<ReturnType<typeof submit>>;
+  try {
+    r = await submit(site.name, { keepExamples });
+  } catch (e) {
+    const m = (e as Error).message;
+    throw new Fail(
+      m,
+      /no preview|changed since/.test(m)
+        ? `preview it first (${again}), show the user, then send that with --yes`
+        : /not installed|auth|HTTP 401/.test(m)
+          ? "install the GitHub CLI and sign in: gh auth login"
+          : /already public in your fork/.test(m)
+            ? "tell the user the files may be public in their fork; fix the cause and run it again to open the pull request"
+            : "no file of the spec was sent; fix the cause and run it again",
+    );
+  }
+  out({
+    ok: true,
+    ...r,
+    next: "a maintainer reviews the pull request and CI checks it with the shared rules; once it merges, anyone can api-anything pull it",
+  });
   return 0;
 }
 
@@ -817,6 +923,8 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
   ops: { run: cmdOps, flags: [] },
   heal: { run: cmdHeal, flags: [] },
   export: { run: cmdExport, flags: ["out", "keep-examples", "force"] },
+  pull: { run: cmdPull, flags: [] },
+  publish: { run: cmdPublish, flags: ["keep-examples", "yes"] },
   mcp: { run: cmdMcp, flags: ["allow-writes"] },
 };
 

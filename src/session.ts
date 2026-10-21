@@ -22,6 +22,13 @@ export interface Session {
   /** values of session: refs (auth/anti-bot headers), refreshed by every capture */
   values: Record<string, string>;
   /**
+   * The host of the request each value was captured from. A session: ref resolves only for a request
+   * to that host, so a spec cannot send a value to a host of its choosing, a sibling on the same
+   * site included. A value from before the field has none and is sent as before; `pull` drops those,
+   * since a pulled spec is someone else's.
+   */
+  valueHosts?: Record<string, string>;
+  /**
    * What a learn classified each name in `values` as. A save-time scan skips a "setting"; a name with
    * no entry, one a file written before the field or a refused add left behind, is scanned like a
    * credential until a learn classifies it. "credential" is sticky: no later learn downgrades one, and
@@ -146,6 +153,7 @@ export function loadSession(site: string): Session {
   return {
     cookies: s.cookies ?? [],
     values: s.values ?? {},
+    ...(s.valueHosts && typeof s.valueHosts === "object" ? { valueHosts: s.valueHosts } : {}),
     ...(s.kinds ? { kinds: s.kinds } : {}),
     ...(Array.isArray(s.origins) ? { origins: s.origins } : {}),
     source: s.source,
@@ -203,11 +211,14 @@ export function saveSession(site: string, s: Session, urls: (string | undefined)
 
 const expired = (c: StoredCookie, now: number) => c.expires > 0 && c.expires * 1000 <= now;
 
-/** Merge a browser run's cookies and session values into the stored session and save it. */
+/**
+ * Merge a browser run's cookies and session values into the stored session and save it. `captured`:
+ * the values, and the URL of the request they were sent in, whose host each is bound to.
+ */
 export function mergeCapture(
   site: string,
   cookies: StoredCookie[],
-  values: Record<string, string> = {},
+  captured: { from: string; values: Record<string, string> } = { from: "", values: {} },
   /**
    * a learn's classification of `values`, and the URLs its operation sends to or opens; without one a
    * name whose value changed is unclassified again
@@ -215,8 +226,14 @@ export function mergeCapture(
   learned?: { settings: string[]; urls?: (string | undefined)[] },
   now = Date.now(),
 ): Session {
+  const { values } = captured;
   return withLock(sessionFile(site), () => {
     const s = loadSession(site);
+    const valueHosts = { ...s.valueHosts };
+    if (Object.keys(values).length) {
+      const host = new URL(captured.from).hostname.toLowerCase();
+      for (const name of Object.keys(values)) valueHosts[name] = host;
+    }
     const key = (c: StoredCookie) => `${c.name}\0${c.domain.toLowerCase()}\0${c.path}`;
     const jar = new Map(s.cookies.map((c) => [key(c), c]));
     for (const c of cookies) jar.set(key(c), c);
@@ -235,11 +252,25 @@ export function mergeCapture(
     const merged = {
       cookies: [...jar.values()].filter((c) => !expired(c, now)),
       values: { ...s.values, ...values },
+      ...(Object.keys(valueHosts).length ? { valueHosts } : {}),
       source: s.source,
       ...(Object.keys(kinds).length ? { kinds } : {}),
       ...(s.origins ? { origins: s.origins } : {}),
     };
     return saveSession(site, merged, learned?.urls);
+  });
+}
+
+/**
+ * Delete the values that have no host to go back to (from before `valueHosts`), before a spec
+ * someone else wrote uses this session: such a value would go wherever its request points. The next
+ * trigger run captures them again, bound.
+ */
+export function dropUnbound(site: string): void {
+  withLock(sessionFile(site), () => {
+    const s = loadSession(site);
+    const bound = Object.entries(s.values).filter(([k]) => s.valueHosts?.[k]);
+    if (bound.length < Object.keys(s.values).length) saveSession(site, { ...s, values: Object.fromEntries(bound) });
   });
 }
 
@@ -293,8 +324,9 @@ export const siteOf = (host: string): string => {
 
 /**
  * Value for a cookie: ref. Prefers a cookie that would be sent to url; else one from the same site
- * (page JS on www.site.com echoes its cookies to api.site.com), never another site's, and a Secure
- * cookie only over https.
+ * (page JS on www.site.com echoes its cookies to api.site.com), never another site's, a Secure
+ * cookie only over https, and never an HttpOnly one: no page script can read that to echo it, and
+ * a host-only session cookie would otherwise reach every other host of its site.
  */
 export function cookieValue(cookies: StoredCookie[], name: string, url?: string, now = Date.now()): string | undefined {
   const live = cookies.filter((c) => c.name === name && !expired(c, now));
@@ -304,7 +336,9 @@ export function cookieValue(cookies: StoredCookie[], name: string, url?: string,
   const u = new URL(url);
   const site = siteOf(u.hostname.toLowerCase());
   const secureOk = u.protocol === "https:" || u.hostname === "localhost" || u.hostname === "127.0.0.1";
-  return live.find((c) => siteOf(c.domain.replace(/^\./, "").toLowerCase()) === site && (!c.secure || secureOk))?.value;
+  return live.find(
+    (c) => !c.httpOnly && siteOf(c.domain.replace(/^\./, "").toLowerCase()) === site && (!c.secure || secureOk),
+  )?.value;
 }
 
 /** One Set-Cookie line, scoped per RFC 6265 to the URL that set it; undefined if it may not be set there. */

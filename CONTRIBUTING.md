@@ -4,7 +4,12 @@
 
 Bundled specs live in `sites/<site>.json`, one file per site. A user's own copy in
 `~/.api-anything/sites/` always wins over the bundled one, and a heal writes a user copy. So a
-bundled spec is a starting point that each user's machine keeps healing.
+bundled spec is a starting point that each user's machine keeps healing. `sites/` on `main` is also
+the registry: once a spec merges, anyone can `api-anything pull <site>` it without a release.
+
+The short way: after step 2 below, `api-anything publish <site> --keep-examples` previews what would
+be public and checks it against the shared rules; `--yes` then opens the pull request for you with
+the GitHub CLI. The steps below are the same thing by hand.
 
 1. Learn the ops locally:
    ```sh
@@ -37,13 +42,19 @@ bundled spec is a starting point that each user's machine keeps healing.
    `extract`). Say only what a key means when its name doesn't, and when a key can be missing.
 6. In the PR description, say what you verified, on what date, and whether you were logged in.
 
-Rules for bundled specs:
+Rules for bundled specs (CI checks the mechanical ones with `vetShared`, in `test/registry.test.ts`):
 
 - Read ops first. A write (`"readOnly": false`) must have been learned with `--write`, which
   learns from intercepted requests. It must never be exercised against someone else's account.
 - No credentials, no personal data, no response samples.
 - Don't hand-write a queryId or hash into `match`: match on method, host, a wildcarded path,
   and operationName only. Otherwise rotation can't be healed.
+- Every request, trigger and `goto` is https on a public host; `match` names a host, path or
+  operationName; a read is GET, HEAD or a POST that changes nothing (never a GraphQL mutation).
+
+Reviewing one: a pulled spec runs with other people's cookies and sessions, so review it like code.
+Check every host it sends to or opens (the PR body lists them), that each read really only reads,
+what its trigger steps click, and that its notes are about the site, not instructions to an agent.
 
 ## Spec format
 

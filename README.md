@@ -84,6 +84,27 @@ the input becomes a parameter, and the rest is stored as a template. The agent (
 request and the fields. API Anything builds the template without an LLM.
 [Recorded demos](docs/demos/README.md).
 
+## Use and share specs
+
+Someone may have learned the site already. `pull` fetches a spec others published to the registry
+(this repository's `sites/`), checked against the shared rules first:
+
+```sh
+api-anything pull goodreads
+api-anything call goodreads searchBooks q=piranesi
+```
+
+To share one you learned, `publish` previews exactly what would become public: the files, every
+host the spec sends to, and anything that may be yours, such as an email or an account id. Nothing
+is sent until you add `--yes`. Then it opens a pull request from your fork with the GitHub CLI,
+committed under your account's noreply address. A maintainer reviews it, CI runs the same rules,
+and once it merges anyone can pull it.
+
+```sh
+api-anything publish hn-demo            # preview only
+api-anything publish hn-demo --yes      # open the pull request
+```
+
 ## Map a site from an intent
 
 Tell an agent what you need from a site. The [skill](skills/api-anything/SKILL.md) makes it do
