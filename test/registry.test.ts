@@ -166,6 +166,17 @@ test("the shared rules refuse what a hostile or careless spec could do with some
       ),
       /GraphQL mutation cannot be a read/,
     ],
+    [
+      "an arg spliced into the document through a ref slot's template",
+      spec(
+        {},
+        {
+          request: { method: "POST", url: "https://news.example.com/graphql", headers: {}, body: '{"query":"{ a }"}' },
+          slots: [{ ref: "cookie:sid", at: ["body", "json:/query"], template: "{q}" }],
+        },
+      ),
+      /a read whose GraphQL document a param fills/,
+    ],
     ["a match of anything", spec({}, { match: { method: "POST" } }), /match names no host, path or operationName/],
     ["a command in a name", spec({}, { name: "search; rm -rf ~ #" }), /operation name .* is not a letter/],
     ["a catastrophic regex", spec({}, { params: [{ name: "q", pattern: "^(a+)+$" }] }), /nests a quantifier/],

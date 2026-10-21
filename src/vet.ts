@@ -146,6 +146,12 @@ export function writesGraphql(doc: string): boolean {
   return false;
 }
 
+/** The `{name}` holes of a template an arg fills: every hole but `{{`, `}}` and the `{cookie:x}`/`{session:x}` refs. */
+const argHoles = (template: string) =>
+  [...template.matchAll(/\{\{|\}\}|\{([^{}]+)\}/g)].flatMap((m) =>
+    m[1] && !/^(cookie|session):/.test(m[1]) ? [m[1]] : [],
+  );
+
 const hostOf = (url: string) => {
   try {
     return new URL(url).hostname.toLowerCase();
@@ -196,7 +202,11 @@ export function vetShared(site: Site, notes?: string): Vetted {
     if (op.readOnly && graphqlDocuments(op.request).some(writesGraphql))
       errors.push(at("a GraphQL mutation cannot be a read"));
     // an arg that is, or is spliced into, the body or the document could make it any request
-    const param = op.slots.filter((sl) => sl.param !== undefined).map((sl) => sl.at.at(-1)!);
+    // an arg reaches a param's own slot, and any slot whose template has a hole that is no ref: a ref
+    // slot's template is filled from the args too
+    const param = op.slots
+      .filter((sl) => sl.param !== undefined || argHoles(sl.template ?? "").length > 0)
+      .map((sl) => sl.at.at(-1)!);
     if (op.readOnly && param.some((st) => WHOLE_BODY.test(st))) errors.push(at("a read whose whole body a param is"));
     else if (op.readOnly && param.some((st) => DOCUMENT_AT.test(st)) && isGraphql(op))
       errors.push(at("a read whose GraphQL document a param fills"));
