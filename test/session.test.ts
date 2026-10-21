@@ -15,6 +15,7 @@ import {
 } from "../src/session.js";
 import type { StoredCookie } from "../src/types.js";
 
+const X = "https://x.com/i/api/graphql/ID/UserByScreenName";
 const c = (name: string, value: string, domain: string, extra: Partial<StoredCookie> = {}): StoredCookie => ({
   name,
   value,
@@ -90,47 +91,62 @@ test("session store: API_ANYTHING_HOME override, 0700 dirs, 0600 files, merge by
   assert.equal(home(), process.env.API_ANYTHING_HOME);
   assert.deepEqual(loadSession("x"), { cookies: [], values: {}, source: undefined, updatedAt: undefined });
   mergeCapture("x", [c("ct0", "one", ".x.com"), c("old", "gone", ".x.com", { expires: 1 })], {
-    authorization: "Bearer A",
+    from: X,
+    values: { authorization: "Bearer A" },
   });
-  const s = mergeCapture("x", [c("ct0", "two", ".x.com")], { "x-guest-token": "123" });
+  const s = mergeCapture("x", [c("ct0", "two", ".x.com")], { from: X, values: { "x-guest-token": "123" } });
   assert.deepEqual(
     s.cookies.map((k) => k.value),
     ["two"],
   );
   assert.deepEqual(s.values, { authorization: "Bearer A", "x-guest-token": "123" });
+  // each value is bound to the host of the request it was captured from
+  assert.deepEqual(s.valueHosts, { authorization: "x.com", "x-guest-token": "x.com" });
   assert.equal(s.kinds, undefined);
   // A learn classifies every value it stored. A merge without a classification records nothing new.
-  assert.deepEqual(mergeCapture("x", [], { theme: "dark", at: "T" }, { settings: ["theme"] }).kinds, {
+  assert.deepEqual(
+    mergeCapture("x", [], { from: X, values: { theme: "dark", at: "T" } }, { settings: ["theme"] }).kinds,
+    {
+      theme: "setting",
+      at: "credential",
+    },
+  );
+  assert.deepEqual(mergeCapture("x", [], { from: X, values: { locale: "en-GB" } }).kinds, {
     theme: "setting",
     at: "credential",
   });
-  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB" }).kinds, { theme: "setting", at: "credential" });
   // a name no learn classified yet becomes a setting when one reads it as one...
-  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB" }, { settings: ["locale"] }).kinds, {
+  assert.deepEqual(mergeCapture("x", [], { from: X, values: { locale: "en-GB" } }, { settings: ["locale"] }).kinds, {
     theme: "setting",
     at: "credential",
     locale: "setting",
   });
   // ...but a credential stays one, however a later learn reads the same name
-  assert.deepEqual(mergeCapture("x", [], { at: "T", theme: "dark" }, { settings: ["at", "theme"] }).kinds, {
-    theme: "setting",
-    at: "credential",
-    locale: "setting",
-  });
-  assert.deepEqual(mergeCapture("x", [], { theme: "dark" }, { settings: [] }).kinds, {
+  assert.deepEqual(
+    mergeCapture("x", [], { from: X, values: { at: "T", theme: "dark" } }, { settings: ["at", "theme"] }).kinds,
+    {
+      theme: "setting",
+      at: "credential",
+      locale: "setting",
+    },
+  );
+  assert.deepEqual(mergeCapture("x", [], { from: X, values: { theme: "dark" } }, { settings: [] }).kinds, {
     theme: "credential",
     at: "credential",
     locale: "setting",
   });
   // A refresh replaces values without classifying them: a value read back unchanged keeps its kind, and
   // a credential stays one whatever the page now puts there...
-  assert.deepEqual(mergeCapture("x", [], { locale: "en-GB", at: "T2", theme: "x" }).kinds, {
+  assert.deepEqual(mergeCapture("x", [], { from: X, values: { locale: "en-GB", at: "T2", theme: "x" } }).kinds, {
     theme: "credential",
     at: "credential",
     locale: "setting",
   });
   // ...but a setting whose value changed is unclassified again, so the scan protects the new text
-  assert.deepEqual(mergeCapture("x", [], { locale: "de-DE" }).kinds, { theme: "credential", at: "credential" });
+  assert.deepEqual(mergeCapture("x", [], { from: X, values: { locale: "de-DE" } }).kinds, {
+    theme: "credential",
+    at: "credential",
+  });
   assert.deepEqual(
     loadSession("x").cookies.map((k) => k.value),
     ["two"],
@@ -159,7 +175,7 @@ test("an operation's origins count as the site's own for its learn's write only,
   process.env.API_ANYTHING_HOME = mkdtempSync(join(tmpdir(), "api-anything-origins-"));
   const page = "https://private-value.test/";
   const urls = ["https://private-value.test/api?q={q}"];
-  const host = { "one/host": "private-value.test" };
+  const host = { from: page, values: { "one/host": "private-value.test" } };
   // the learn's write: the cookie holding its origin does not protect the setting it holds
   mergeCapture("o", [c("lu", encodeURIComponent(page), "private-value.test")], host, { settings: ["one/host"], urls });
   assert.deepEqual(loadSession("o").kinds, { "one/host": "setting" });

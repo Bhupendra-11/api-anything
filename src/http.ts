@@ -78,7 +78,9 @@ function coerce(p: Param, v: unknown): unknown {
 function resolveRef(ref: string, session: Session, url: string): string | undefined {
   const i = ref.indexOf(":");
   const name = ref.slice(i + 1);
-  return ref.startsWith("cookie:") ? cookieValue(session.cookies, name, url) : session.values[name];
+  if (ref.startsWith("cookie:")) return cookieValue(session.cookies, name, url);
+  const bound = session.valueHosts?.[name];
+  return bound === undefined || bound === new URL(url).hostname.toLowerCase() ? session.values[name] : undefined;
 }
 
 function transform(v: string, t: "strip-quotes" | "url-decode" | undefined): string {

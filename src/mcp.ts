@@ -15,6 +15,7 @@ import { profileDir } from "./heal.js";
 import { browserSource, cookieNames, importSession, loggedIn, resolveLoginTarget } from "./login.js";
 import { loadSession, saveSession, sessionFile, withLock } from "./session.js";
 import { listSites, loadSite, siteNotes } from "./store.js";
+import { SHARED_NOTE } from "./vet.js";
 
 export const VERSION = (
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }
@@ -129,7 +130,14 @@ export function createServer({ allowWrites = false }: { allowWrites?: boolean } 
     },
     guarded(async ({ site }: { site: string }) => {
       const r = loadSite(site);
-      if (!r) return reply({ error: `no site "${site}"`, next: "list_sites" }, true);
+      if (!r)
+        return reply(
+          {
+            error: `no site "${site}"`,
+            next: `list_sites; if it is not there, the shell command api-anything pull ${site.toLowerCase()} fetches it if someone shared it`,
+          },
+          true,
+        );
       const notes = siteNotes(r.site.name);
       return reply({
         site,
@@ -150,6 +158,7 @@ export function createServer({ allowWrites = false }: { allowWrites?: boolean } 
               ...(p.pattern ? { pattern: p.pattern } : {}),
             })),
           })),
+        ...(r.site.shared ? { shared: SHARED_NOTE } : {}),
         ...(notes ? { notes } : {}),
       });
     }),

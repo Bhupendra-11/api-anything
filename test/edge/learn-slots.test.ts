@@ -60,13 +60,14 @@ const learn = (exchanges: Exchange[], examples: Examples, extra: Partial<Paramet
     ...extra,
   });
 
+// readable by page script, as a cookie a page copies into a request to api.site.test must be
 const cookie = (name: string, value: string): StoredCookie => ({
   name,
   value,
   domain: "site.test",
   path: "/",
   expires: -1,
-  httpOnly: true,
+  httpOnly: false,
   secure: false,
 });
 
@@ -1405,7 +1406,7 @@ test("a refresh that changes a setting's value unclassifies it, one that reads i
   assert.deepEqual(loadSession("c25-refresh").kinds, { "one/cache": "setting" });
   // a trigger run or a recapture refreshes the stored values without classifying them, and the page can
   // put anything at the slot's position: a changed value is unclassified again, so the scan protects it
-  mergeCapture("c25-refresh", [], { "one/cache": token });
+  mergeCapture("c25-refresh", [], { from: local, values: { "one/cache": token } });
   assert.equal(loadSession("c25-refresh").values["one/cache"], token);
   assert.equal(loadSession("c25-refresh").kinds?.["one/cache"], undefined);
   // op two copies the refreshed text base64 where no pass can make it a ref
@@ -1419,7 +1420,7 @@ test("a refresh that changes a setting's value unclassifies it, one that reads i
     store: scoped("sessions"),
   });
   const ref = op.slots.at(-1)!.ref!.slice(8);
-  mergeCapture("c25-same", [], { [ref]: "sessions" });
+  mergeCapture("c25-same", [], { from: sessionsUrl, values: { [ref]: "sessions" } });
   assert.deepEqual(loadSession("c25-same").kinds, { [ref]: "setting" });
   await addOp("c25-same", "two", xhr({ url: `${local}?q=kittens&include_trigger_sessions=true` }));
   assert.deepEqual(exportSite("c25-same").secrets, []);
@@ -1436,7 +1437,10 @@ test("a rotation of what protects a setting does not unprotect it", async () => 
       "c25-rot-learn",
       (site) => addOp(site, "one", xhr({ url: `${local}?q=kittens`, headers: { authorization: `Bearer ${newer}` } })),
     ],
-    ["c25-rot-refresh", async (site) => mergeCapture(site, [], { "one/authorization": `Bearer ${newer}` })],
+    [
+      "c25-rot-refresh",
+      async (site) => mergeCapture(site, [], { from: local, values: { "one/authorization": `Bearer ${newer}` } }),
+    ],
   ];
   for (const [site, rotate] of rotations) {
     const one = xhr({ url: `${local}?q=kittens&theme=${token}`, headers: { authorization: `Bearer ${token}` } });

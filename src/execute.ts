@@ -27,7 +27,16 @@ import {
 } from "./heal.js";
 import { BadHeader, buildRequest, holdsRef, nextHop, RedirectRefused, type Sent, send, withDefaults } from "./http.js";
 import { reimportIfBrowser } from "./login.js";
-import { loadSession, loggedIn, mergeCapture, type Session, saveSession, sessionFile, withLock } from "./session.js";
+import {
+  dropUnbound,
+  loadSession,
+  loggedIn,
+  mergeCapture,
+  type Session,
+  saveSession,
+  sessionFile,
+  withLock,
+} from "./session.js";
 import type { Operation, Site } from "./spec.js";
 import { lastHealAt, loadSite, markStale, rememberedTier, rememberTier, staleMark } from "./store.js";
 import type { StoredCookie } from "./types.js";
@@ -391,7 +400,7 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
   return fail(b, { reason: `${b.reason}; heal failed: ${h.reason}` });
 }
 
-function resolve(siteName: string, opName: string): { site: Site; op: Operation } | Result {
+function resolve(siteName: string, opName: string): { site: Site; op: Operation; theirs: boolean } | Result {
   let r: ReturnType<typeof loadSite>;
   try {
     r = loadSite(siteName);
@@ -409,7 +418,7 @@ function resolve(siteName: string, opName: string): { site: Site; op: Operation 
       ok: false,
       class: "input",
       reason: `no site "${siteName}"`,
-      next: "api-anything sites lists what exists; api-anything add creates one",
+      next: `api-anything sites lists what exists; api-anything pull ${siteName} fetches it if someone shared it`,
     };
   const op = r.site.operations.find((o) => o.name === opName);
   if (!op)
@@ -419,7 +428,8 @@ function resolve(siteName: string, opName: string): { site: Site; op: Operation 
       reason: `no operation "${opName}" on ${r.site.name}`,
       next: `api-anything ops ${r.site.name}`,
     };
-  return { site: r.site, op };
+  // someone else's: pulled, bundled, or a heal's copy of a pulled one
+  return { site: r.site, op, theirs: r.source !== "user" || !!r.site.shared };
 }
 
 /** Call one operation. Never throws for site-side failures; the result carries class, reason and next. */
@@ -433,7 +443,7 @@ export async function call(
   const done = (r: Result): CallResult => ({ ...r, ms: Date.now() - t0 });
   const found = resolve(siteName, opName);
   if ("ok" in found) return done(found);
-  const { site, op } = found;
+  const { site, op, theirs } = found;
   siteName = site.name;
   const write = !op.readOnly;
   if (write && !opts.allowWrites) {
@@ -459,6 +469,7 @@ export async function call(
   args = withDefaults(op, args);
   let session: Session;
   try {
+    if (theirs) dropUnbound(siteName);
     session = loadSession(siteName);
   } catch (e) {
     return done({
@@ -637,8 +648,9 @@ export async function heal(
   const t0 = Date.now();
   const found = resolve(siteName, opName);
   if ("ok" in found) return { ...found, ms: Date.now() - t0 };
-  const { site, op } = found;
+  const { site, op, theirs } = found;
   siteName = site.name;
+  if (theirs) dropUnbound(siteName);
   if (!op.readOnly) {
     return {
       ok: false,

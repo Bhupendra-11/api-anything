@@ -2,8 +2,9 @@
  * What counts as a credential, and the scan that finds one in a spec. Learning uses these to turn
  * credentials into references and to check none is left; the store uses them before a save or an export.
  */
-import type { Step } from "./codec.js";
+import { type Leaf, type Step, walk } from "./codec.js";
 import type { Session } from "./session.js";
+import type { Request } from "./spec.js";
 
 export const SESSION_HEADER =
   /^(authorization|x-[a-z0-9-]*token|x-csrf[a-z0-9-]*|x-xsrf[a-z0-9-]*|x-goog-batchexecute-bgr|x-client-transaction-id|x-fb-lsd|x-ig-www-claim)$/i;
@@ -31,6 +32,20 @@ export function credentialName(name: string): boolean {
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .some((w) => CREDENTIAL_WORD.test(w));
+}
+
+/**
+ * The leaves of a request holding a literal the learner would have made a ref: a hand-written or
+ * older spec's credential. `pub`: the lower-cased names the op lists as public.
+ */
+export function literalCredentials(req: Request, pub: Set<string>): Leaf[] {
+  return walk(req).filter(
+    (l) =>
+      l.type === "string" &&
+      !l.container &&
+      !pub.has(leafName(l.at).toLowerCase()) &&
+      isCredential(leafName(l.at), l.value),
+  );
 }
 
 export const URLISH = /^[a-z][a-z0-9+.-]*:\/\//i;

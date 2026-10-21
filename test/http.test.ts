@@ -82,6 +82,25 @@ test("buildRequest: defaults, missing required params, bad types, missing sessio
   assert.throws(() => buildRequest(op(), { text: "a", tweet_id: "1", dark: "yes" }, session), /must be boolean/);
 });
 
+test("a session value goes only back to the host it was captured from; a cookie's fallback skips HttpOnly", () => {
+  const bound: Session = { ...session, valueHosts: { authorization: "x.com" } };
+  const to = (url: string, s = bound) =>
+    buildRequest(op({ request: { ...op().request, url } }), { text: "a", tweet_id: "5" }, s);
+  assert.equal(to("https://x.com/i/api/graphql/ID/CreateTweet").headers.authorization, "Bearer PUBLIC");
+  // a spec that points the request elsewhere gets no value to send there, a sibling host of the site included
+  assert.equal("authorization" in to("https://collect.example.com/x").headers, false);
+  assert.equal("authorization" in to("https://upload.x.com/x").headers, false);
+  // a value from before the binding is sent as it was (a pull drops those for the site it pulls)
+  assert.equal(to("https://collect.example.com/x", session).headers.authorization, "Bearer PUBLIC");
+  // the site fallback is for a cookie page script can read and echo: never an HttpOnly one
+  const hostOnly = (httpOnly: boolean): Session => ({
+    cookies: [{ ...cookie("ct0", "csrf123", "accounts.x.com"), httpOnly }],
+    values: {},
+  });
+  assert.equal(to("https://upload.x.com/x", hostOnly(false)).headers["x-csrf-token"], "csrf123");
+  assert.equal("x-csrf-token" in to("https://upload.x.com/x", hostOnly(true)).headers, false);
+});
+
 test("a number past 2^53 goes exactly as plain digits; a form that would be rounded is refused, saying why", () => {
   const sent = (count: string) =>
     /"count":([^,]+),/.exec(buildRequest(op(), { text: "a", tweet_id: "5", count }, session).body!)?.[1];

@@ -134,17 +134,19 @@ export const writeGuard = (m?: Match, o: { url?: string; args?: Args } = {}) => 
  * origin, as Chrome itself would follow it (a signed read the server checks elsewhere with a 307).
  * The hops of any other chain are judged by their own address: an asset sent on to a write stops.
  * ponytail: that includes a 307 of the op's own read to a write on its own site; the server chose
- * it, and nothing in the spec tells it from a check.
+ * it, and nothing in the spec tells it from a check. `shared`: the spec is someone else's, and an
+ * unsafe hop of that chain to another site is aborted, before the steps run too.
  */
-const readGuard = (m: Match) => {
+const readGuard = (m: Match, shared = false) => {
   const own = (e: Exchange) =>
     !SAFE_METHODS.has(e.request.method.toUpperCase()) && Object.keys(m).length > 0 && matches(m, e.request);
+  const site = (e: Exchange) => siteOf(new URL(e.request.url).hostname);
   return (e: Exchange, acting: boolean, via?: Exchange): boolean =>
-    acting &&
     e.resourceType !== "websocket" &&
     !SAFE_METHODS.has(e.request.method.toUpperCase()) &&
-    !own(e) &&
-    !(via && own(via));
+    // Someone else's spec does not get the 307 exemption off its site, from the first request on: Chrome
+    // would send the op's body and headers, a session's values among them, wherever the server pointed.
+    ((shared && !!via && own(via) && site(e) !== site(via)) || (acting && !own(e) && !(via && own(via))));
 };
 
 /**
@@ -315,7 +317,8 @@ export async function runOpTrigger(
   const isHit = (e: Exchange) => matches(op.match, e.request);
   // A write's tier-3 run is the UI sending it for real, once; learning or healing one intercepts it.
   const once = !o.intercept && !op.readOnly ? sendOnce(op.match) : undefined;
-  const intercept = once ?? (o.intercept ? writeGuard(op.match, { url: t.url, args }) : readGuard(op.match));
+  const shared = !!loadSite(site)?.site.shared;
+  const intercept = once ?? (o.intercept ? writeGuard(op.match, { url: t.url, args }) : readGuard(op.match, shared));
   const capture = await runTrigger({ ...t, profileDir: profileDir(), intercept, match: isHit });
   const hits = capture.exchanges.filter(isHit);
   // a real write's answer is a request that left: a repeat that was stopped answers nothing
@@ -324,7 +327,7 @@ export async function runOpTrigger(
   // Session values (a site-wide API key, a guest token) don't depend on the args: refresh them from
   // the op's own request even when the page asked for other args, whose answer is never returned.
   const source = matched ?? hits.find((e) => e.response && e.response.status < 400);
-  mergeCapture(site, capture.cookies, source ? sessionValuesOf(op, source) : {});
+  mergeCapture(site, capture.cookies, source && { from: source.request.url, values: sessionValuesOf(op, source) });
   const wall = matched?.response ? undefined : loginWall(capture, t.url);
   const { repeats, resends } = once?.stopped ?? {};
   return {
@@ -786,10 +789,15 @@ export async function addOperation(input: AddInput): Promise<AddResult> {
     ...(prior && !run2 && prior.minTier > learned.operation.minTier ? { minTier: prior.minTier } : {}),
     response: withRecipe(learned.operation.response, r),
   };
-  const session = mergeCapture(i.site, (run2 ?? run1).cookies, learned.sessionValues, {
-    settings: learned.settings,
-    urls: opUrls(learned.operation),
-  });
+  const session = mergeCapture(
+    i.site,
+    (run2 ?? run1).cookies,
+    { from: learned.operation.request.url, values: learned.sessionValues },
+    {
+      settings: learned.settings,
+      urls: opUrls(learned.operation),
+    },
+  );
 
   // Values that differ between two page loads are often session-scoped ids, not per-request
   // signatures. One replay of run 1's template with example 2's args tells them apart.
@@ -1071,7 +1079,11 @@ export async function healOperation(
   let last: Attempt | undefined;
   const callArgs = withDefaults(op, args);
 
-  const scanned = await rescan(site, op, callArgs, o.fetchImpl).catch(() => undefined);
+  // A rescan sends a token it found in the site's own pages to the op's request URL before any check
+  // runs, so someone else's spec, which chose that URL, heals by recapture only.
+  const scanned = loadSite(site)?.site.shared
+    ? undefined
+    : await rescan(site, op, callArgs, o.fetchImpl).catch(() => undefined);
   const swapped = scanned ? `rescan swapped ${scanned.diff}, replay said ${"%s"}` : "";
   if (scanned) {
     budget--;
@@ -1189,7 +1201,7 @@ export async function healOperation(
     return { outcome: "failed", attempt: last, fallback, reason: `re-learning failed: ${(e as Error).message}` };
   }
   // A deploy that adds an auth/anti-bot header: its value is needed to validate (and later send) the candidate.
-  mergeCapture(site, [], sessionValues, { settings, urls: opUrls(fresh) });
+  mergeCapture(site, [], { from: fresh.request.url, values: sessionValues }, { settings, urls: opUrls(fresh) });
   // An arg equal to a constant the old template had there ("search" in /api/search) is not a param position.
   const oldLeaves = new Map(walk(op.request).map((l) => [JSON.stringify(l.at), l.value.toLowerCase()]));
   const oldSlots = new Set(op.slots.map((sl) => JSON.stringify(sl.at)));
